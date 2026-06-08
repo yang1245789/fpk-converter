@@ -3,7 +3,7 @@
 ### This script is called after the user installs the application.
 
 LOG_FILE="${TRIM_PKGVAR}/install.log"
-APP_DIR="${TRIM_PKG}/app/fpk-converter"
+APP_DIR="${TRIM_PKG}/app/fpkconverter"
 VENV_DIR="${APP_DIR}/venv"
 
 # Log function

@@ -38,7 +38,7 @@ deactivate () {
 # unset irrelevant variables
 deactivate nondestructive
 
-VIRTUAL_ENV=/data/user/work/fpk-converter/app/fpk-converter/venv
+VIRTUAL_ENV=/app/fpkconverter/venv
 export VIRTUAL_ENV
 
 _OLD_VIRTUAL_PATH="$PATH"

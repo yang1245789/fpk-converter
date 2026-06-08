@@ -1,6 +1,6 @@
 {
     ".url": {
-        "fpk-converter.Application": {
+        "fpkconverter.fpkconverter": {
             "protocol": "http",
             "port": "5000",
             "url": "/"

@@ -34,8 +34,8 @@ def internal_error(error):
 
 # Get environment variables
 PKG_DIR = os.environ.get('TRIM_PKG', '/app')
-VAR_DIR = os.environ.get('TRIM_PKGVAR', '/var/lib/fpk-converter')
-CODE_DIR = os.path.join(PKG_DIR, 'app', 'fpk-converter')
+VAR_DIR = os.environ.get('TRIM_PKGVAR', '/var/lib/fpkconverter')
+CODE_DIR = os.path.join(PKG_DIR, 'app', 'fpkconverter')
 DB_PATH = os.path.join(VAR_DIR, 'fpk_converter.db')
 CONFIG_PATH = os.path.join(VAR_DIR, 'config.json')
 
@@ -235,7 +235,7 @@ import os
 import json
 
 # 读取配置
-config_path = os.path.join(os.environ.get('TRIM_PKGVAR', '/var/lib/fpk-converter'), 'start_config.json')
+config_path = os.path.join(os.environ.get('TRIM_PKGVAR', '/var/lib/fpkconverter'), 'start_config.json')
 with open(config_path, 'r') as f:
     cfg = json.load(f)
 
