@@ -1,9 +1,0 @@
-{
-    ".url": {
-        "fpkconverter.fpkconverter": {
-            "protocol": "http",
-            "port": "5000",
-            "url": "/"
-        }
-    }
-}

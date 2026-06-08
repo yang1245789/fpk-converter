@@ -1,58 +1,25 @@
-# fpk-converter
+# 飞牛NAS 视频自动转码工具
 
-飞牛 NAS (FNOS) 视频自动转码工具，支持 Intel Quick Sync GPU 硬件加速。
-
-## 功能特性
-
-- **自动监测** 指定文件夹中的视频文件
-- **智能转码** 目标统一为 H.265（HEVC），节省 30-50% 存储空间
-- **GPU 加速** 支持 Intel Quick Sync Video 硬件转码
-- **省空间判断** 转码后自动比较文件大小，保留较小的版本
-- **持久化日志** SQLite 数据库记录已处理文件，避免重复转码
-- **延迟处理** 文件写入结束后 15 分钟再转码，避免处理正在下载的视频
-- **跳过优化** 1080p HEVC 且码率 < 10Mbps 的视频不再转码
-- **Web UI** 简洁的图形化管理界面
-
-## 转码规则
-
-| 条件 | 处理方式 |
-|------|---------|
-| ≥1080p 视频 | 转码为 H.265 1080p（超高清缩放到 1080p） |
-| <1080p 视频 | 保持原分辨率，转码为 H.265 |
-| 1080p HEVC 且码率 < 10Mbps | 跳过（已足够节省空间） |
-| 1080p HEVC 且码率 ≥ 10Mbps | 尝试转码，可能进一步缩小 |
-| H.264 任意分辨率 | 转码为 H.265 |
-
-- 码率上限：**13 Mbps**
-- 质量参数：**CRF 23**
-- 音频：**直接复制（copy）**，不重新编码
+自动监测文件夹中视频文件，智能转码为 H.265 节省存储空间。
 
 ## 安装
 
-1. 下载最新的 `.fpk` 安装包
-2. 登录飞牛 NAS 后台 → **应用中心** → **手动安装**
-3. 上传 `.fpk` 文件完成安装
+### 方法一：下载安装包
+从 [Release](https://github.com/yang1245789/fpk-converter/releases) 下载 `fpkconverter.fpk`，在飞牛 NAS 应用中心手动安装。
 
-## 使用方法
+### 方法二：自行打包
+```bash
+git clone https://github.com/yang1245789/fpk-converter.git
+cd fpk-converter
+fnpack build
+# 生成 fpkconverter.fpk
+```
 
-1. 安装完成后访问 **http://你的NASIP:5000**
-2. 设置要监控的视频文件夹路径
-3. 点击 **启动服务**
-4. 视频文件写入 15 分钟后自动开始转码
+## 使用
+安装后访问 `http://你的NAS_IP:5000`
 
-## 系统要求
-
-- 飞牛 NAS (FNOS)
-- FFmpeg（建议预装，容器中自带）
-- Python 3
-
-## 技术栈
-
-- **转码**: FFmpeg + libx265 / hevc_qsv
-- **文件监控**: watchdog
-- **Web 服务**: Flask
-- **数据持久化**: SQLite
-
-## 许可证
-
-MIT License
+## 功能
+- 自动监测视频文件
+- H.265 转码节省 30-50% 空间
+- Intel Quick Sync GPU 加速
+- Web UI 管理界面
