@@ -1,93 +1,115 @@
 #!/bin/bash
-# 飞牛应用启动/停止/状态脚本
-# 参照论坛 node_exporter 成功案例
+# ============================================================
+# 飞牛应用 cmd/main - 启动/停止/状态管理
+# 环境变量: TRIM_PKG(应用安装目录), TRIM_PKGVAR(数据目录)
+# ============================================================
 
-APP_DIR="${TRIM_PKG}/app/fpkconverter"
-PKG_DIR="${APP_DIR}/packages"
-WEB_SERVER="${APP_DIR}/web_server.py"
-LOG_FILE="${TRIM_PKGVAR}/info.log"
-PID_FILE="${TRIM_PKGVAR}/app.pid"
+# 使用脚本所在目录定位 app/fpkconverter (cmd 和 app 在同一个 TRIM_PKG 下)
+MY_DIR="$(cd "$(dirname "$0")" && pwd)"
+APP_DIR="${MY_DIR}/../app/fpkconverter"
+# 如果上面不对，尝试 TRIM_PKG 环境变量
+if [ ! -f "${APP_DIR}/web_server.py" ] && [ -n "${TRIM_PKG}" ]; then
+    APP_DIR="${TRIM_PKG}/app/fpkconverter"
+fi
+# 最终兜底
+if [ ! -f "${APP_DIR}/web_server.py" ]; then
+    APP_DIR="/var/apps/fpkconverter/app/fpkconverter"
+fi
 
-mkdir -p "${TRIM_PKGVAR}"
+WEB="${APP_DIR}/web_server.py"
+PKG="${APP_DIR}/packages"
+LOG="/var/log/fpkconverter.log"
 
-log_msg() {
-    echo -e "$(date +'%Y/%m/%d %H:%M:%S')\t$*" >> "${LOG_FILE}"
+# === 诊断日志 ===
+log() {
+    echo "$(date '+%Y/%m/%d %H:%M:%S') [$1] $2" >> "${LOG}"
 }
-
-check_process() {
-    local pid=$1
-    kill -0 "${pid}" 2>/dev/null && return 0 || return 1
-}
-
-find_process() {
-    ps -fe | grep 'web_server\.py' | grep -v grep | grep -v tail | wc -l
-}
+log "MAIN" "Called with arg=$1, MY_DIR=${MY_DIR}, APP_DIR=${APP_DIR}"
+log "MAIN" "TRIM_PKG=${TRIM_PKG}, TRIM_PKGVAR=${TRIM_PKGVAR}"
+log "MAIN" "python3=$(which python3 2>/dev/null || echo not_found)"
 
 case $1 in
 start)
-    processNum=$(find_process)
-    if [ "${processNum}" -ne 0 ]; then
-        log_msg "Already running"
+    log "MAIN" "=== START ==="
+
+    # 检查是否已在运行
+    RUNNING=$(ps -fe 2>/dev/null | grep 'web_server\.py' | grep -v grep | grep -v tail | wc -l)
+    if [ "${RUNNING}" -gt 0 ]; then
+        log "MAIN" "Already running (${RUNNING} process(es))"
         exit 0
     fi
 
-    if [ ! -f "${WEB_SERVER}" ]; then
-        log_msg "ERROR: ${WEB_SERVER} not found"
+    # 检查文件
+    if [ ! -f "${WEB}" ]; then
+        log "MAIN" "ERROR: ${WEB} not found"
+        exit 1
+    fi
+    if [ ! -d "${PKG}" ]; then
+        log "MAIN" "ERROR: packages dir not found: ${PKG}"
         exit 1
     fi
 
-    if [ ! -d "${PKG_DIR}" ]; then
-        log_msg "ERROR: packages dir not found"
-        exit 1
+    # 设置 PYTHONPATH
+    export PYTHONPATH="${PKG}:${PYTHONPATH}"
+    log "MAIN" "PYTHONPATH=${PYTHONPATH}"
+
+    # 切换到应用目录
+    cd "${APP_DIR}" || { log "MAIN" "ERROR: cannot cd to ${APP_DIR}"; exit 1; }
+    log "MAIN" "Working dir: $(pwd)"
+
+    # 测试 python 能否找到 flask
+    python3 -c "import flask" 2>&1 | head -1 >> "${LOG}"
+    if [ $? -ne 0 ]; then
+        log "MAIN" "WARNING: 'import flask' failed, but will try anyway"
+    else
+        log "MAIN" "flask import OK"
     fi
 
-    cd "${APP_DIR}"
-    export PYTHONPATH="${PKG_DIR}:${PYTHONPATH}"
-    log_msg "Starting with PYTHONPATH=${PKG_DIR}"
+    # 启动
+    log "MAIN" "Launching: python3 ${WEB} ..."
+    nohup python3 "${WEB}" >> "${LOG}" 2>&1 &
+    PID=$!
+    log "MAIN" "Started with pid=${PID}"
 
-    nohup python3 "${WEB_SERVER}" >> "${LOG_FILE}" 2>&1 &
-    RETVAL=$?
-
-    if [ ${RETVAL} -eq 0 ]; then
-        echo "$!" > "${PID_FILE}"
-        log_msg "Started ok, pid=$!"
+    # 等 3 秒检查是否存活
+    sleep 3
+    if kill -0 "${PID}" 2>/dev/null; then
+        log "MAIN" "Process ${PID} alive after 3s -> SUCCESS"
         exit 0
     else
-        log_msg "Start failed"
+        log "MAIN" "Process ${PID} DIED within 3s -> FAILURE"
+        log "MAIN" "Last 20 lines of log:"
+        tail -20 "${LOG}" | while read -r line; do log "MAIN" "  ${line}"; done
         exit 1
     fi
     ;;
 
 stop)
-    log_msg "Stopping..."
-    if [ -f "${PID_FILE}" ]; then
-        pid=$(cat "${PID_FILE}")
-        if check_process "${pid}"; then
-            kill -TERM "${pid}" 2>/dev/null
-            local c=0
-            while check_process "${pid}" && [ $c -lt 10 ]; do
-                sleep 1; c=$((c+1))
-            done
-            check_process "${pid}" && kill -KILL "${pid}" 2>/dev/null
-        fi
-        rm -f "${PID_FILE}"
-    fi
-    # 兜底：确保没有残留进程
+    log "MAIN" "=== STOP ==="
+    # 先记录当前运行的进程
+    ps -fe 2>/dev/null | grep 'web_server\.py' | grep -v grep >> "${LOG}"
+    # 杀掉所有 web_server.py 进程
     pkill -f 'web_server\.py' 2>/dev/null
+    sleep 1
+    # 强制
+    pkill -9 -f 'web_server\.py' 2>/dev/null
+    log "MAIN" "Stopped"
     exit 0
     ;;
 
 status)
-    processNum=$(find_process)
-    if [ "${processNum}" -ne 0 ]; then
+    RUNNING=$(ps -fe 2>/dev/null | grep 'web_server\.py' | grep -v grep | grep -v tail | wc -l)
+    if [ "${RUNNING}" -gt 0 ]; then
+        log "MAIN" "STATUS: running (${RUNNING} process(es))"
         exit 0
     else
-        rm -f "${PID_FILE}"
+        log "MAIN" "STATUS: not running"
         exit 3
     fi
     ;;
 
 *)
+    log "MAIN" "Unknown arg: $1"
     exit 1
     ;;
 esac
