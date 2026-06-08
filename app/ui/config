@@ -1,9 +1,14 @@
 {
     ".url": {
-        "fpk-converter.Application": {
+        "fpkconverter.fpkconverter": {
+            "title": "视频自动转码工具",
+            "desc": "自动监测视频文件转码为H.265节省存储空间",
+            "icon": "images/icon.png",
+            "type": "iframe",
             "protocol": "http",
             "port": "5000",
-            "url": "/"
+            "url": "/",
+            "allUsers": true
         }
     }
 }

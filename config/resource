@@ -4,22 +4,22 @@
         "shares":
         [
             {
-                "name": "fpk-converter",
+                "name": "fpkconverter",
                 "permission":
                 {
                     "rw":
                     [
-                        "fpk-converter"
+                        "fpkconverter"
                     ]
                 }
             },
             {
-                "name": "fpk-converter/data",
+                "name": "fpkconverter/data",
                 "permission":
                 {
                     "rw":
                     [
-                        "fpk-converter"
+                        "fpkconverter"
                     ]
                 }
             }
