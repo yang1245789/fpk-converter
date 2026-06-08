@@ -1,5 +1,3 @@
 #!/bin/bash
-
-### This script is called after the user uninstalls the application.
-
+### This script is called before the user uninstalls the application.
 exit 0

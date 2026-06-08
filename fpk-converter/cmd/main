@@ -2,7 +2,7 @@
 
 LOG_FILE="${TRIM_PKGVAR}/info.log"
 PID_FILE="${TRIM_PKGVAR}/app.pid"
-APP_DIR="${TRIM_PKG}/app/code"
+APP_DIR="${TRIM_PKG}/app/fpk-converter"
 VENV_PYTHON="${APP_DIR}/venv/bin/python"
 WEB_SERVER="${APP_DIR}/web_server.py"
 

@@ -1,6 +1,5 @@
 {
-    "defaults":
-    {
-        "run-as": "package"
+    "defaults": {
+        "run-as": "root"
     }
 }
