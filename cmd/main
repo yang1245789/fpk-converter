@@ -1,9 +1,11 @@
 #!/bin/sh
-# 飞牛应用启动/停止/状态脚本
+# 飞牛应用启动/停止/状态脚本 - 使用 bundled venv
 
 LOG="${TRIM_PKGVAR}/info.log"
 PID="${TRIM_PKGVAR}/app.pid"
-APP="${TRIM_PKG}/app/fpkconverter/web_server.py"
+APP_DIR="${TRIM_PKG}/app/fpkconverter"
+PYTHON="${APP_DIR}/venv/bin/python3"
+WEB="${APP_DIR}/web_server.py"
 mkdir -p "${TRIM_PKGVAR}"
 
 log(){ echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG}"; }
@@ -11,42 +13,38 @@ alive(){ kill -0 "$1" 2>/dev/null; }
 
 case $1 in
 start)
-    if [ -f "${PID}" ] && alive "$(cat "${PID}" 2>/dev/null)"; then
-        log "Already running, pid=$(cat "${PID}")"
-        exit 0
+    if [ -f "${PID}" ] && alive "$(cat "${PID}")"; then
+        log "Already running"; exit 0
     fi
-    if ! command -v python3 >/dev/null 2>&1; then
-        log "ERROR: python3 not found"; exit 1
+    if [ ! -f "${PYTHON}" ]; then
+        log "ERROR: bundled python not found at ${PYTHON}"; exit 1
     fi
-    if [ ! -f "${APP}" ]; then
-        log "ERROR: ${APP} not found"; exit 1
-    fi
-    log "Starting web_server.py ..."
-    cd "${TRIM_PKG}/app/fpkconverter" && python3 "${APP}" >> "${LOG}" 2>&1 &
+    log "Starting with bundled python: ${PYTHON}"
+    cd "${APP_DIR}" && "${PYTHON}" "${WEB}" >> "${LOG}" 2>&1 &
     echo "$!" > "${PID}"
     log "Started, pid=$!"
     sleep 1
-    if ! alive "$(cat "${PID}" 2>/dev/null)"; then
-        log "ERROR: process died, check log"
-        rm -f "${PID}"
-        exit 1
+    if ! alive "$(cat "${PID}")"; then
+        log "ERROR: process died, last 5 log lines:"
+        tail -5 "${LOG}" >> "${LOG}"
+        rm -f "${PID}"; exit 1
     fi
     exit 0
     ;;
 stop)
     if [ -f "${PID}" ]; then
-        p=$(cat "${PID}" 2>/dev/null)
+        p=$(cat "${PID}")
         log "Stopping pid=${p}..."
         kill -TERM "${p}" 2>/dev/null
-        c=0; while alive "${p}" 2>/dev/null && [ $c -lt 10 ]; do sleep 1; c=$((c+1)); done
-        alive "${p}" 2>/dev/null && kill -KILL "${p}" 2>/dev/null
+        c=0; while alive "${p}" && [ $c -lt 10 ]; do sleep 1; c=$((c+1)); done
+        alive "${p}" && kill -KILL "${p}" 2>/dev/null
         rm -f "${PID}"
     fi
     exit 0
     ;;
 status)
-    if [ -f "${PID}" ] && alive "$(cat "${PID}" 2>/dev/null)"; then exit 0; fi
+    if [ -f "${PID}" ] && alive "$(cat "${PID}")"; then exit 0; fi
     rm -f "${PID}"; exit 3
     ;;
-*)  exit 1 ;;
+*) exit 1 ;;
 esac

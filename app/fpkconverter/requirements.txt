@@ -1,3 +1,2 @@
-# 此应用使用 Python 标准库，无需额外依赖
-# web_server.py - http.server (stdlib)
-# fpk_converter.py - sqlite3, subprocess (stdlib)
+# 所有依赖已打包在 venv/ 中
+# flask + watchdog + 所有传递依赖
