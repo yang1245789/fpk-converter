@@ -1,2 +1,83 @@
 #!/bin/bash
+#
+# 安装后回调：创建 Python 虚拟环境并安装依赖
+# 该脚本在安装完成后以 root 权限执行
+
+APP_DIR="${TRIM_PKG}/app/fpkconverter"
+VENV_DIR="${APP_DIR}/venv"
+LOG_FILE="${TRIM_PKGVAR}/install.log"
+
+mkdir -p "${TRIM_PKGVAR}"
+
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"
+}
+
+log_msg "开始安装依赖..."
+
+# 检查 python3 是否可用
+if ! command -v python3 &>/dev/null; then
+    log_msg "ERROR: python3 not found"
+    exit 1
+fi
+
+# 检查 pip 是否可用（先检查 venv pip3，再检查系统 pip3，最后 python3 -m pip）
+PIP_CMD=""
+if command -v pip3 &>/dev/null; then
+    PIP_CMD="pip3"
+elif python3 -m pip --version &>/dev/null 2>&1; then
+    PIP_CMD="python3 -m pip"
+fi
+
+# 创建虚拟环境
+log_msg "Creating virtual environment at ${VENV_DIR}..."
+if python3 -m venv "${VENV_DIR}" 2>>"${LOG_FILE}"; then
+    log_msg "Virtual environment created successfully"
+    
+    # 使用 venv 中的 pip 安装依赖
+    "${VENV_DIR}/bin/pip" install flask watchdog --no-cache-dir >>"${LOG_FILE}" 2>&1
+    if [ $? -eq 0 ]; then
+        log_msg "Dependencies installed via venv pip"
+    else
+        log_msg "WARNING: venv pip install failed, trying alternative..."
+    fi
+elif [ -n "${PIP_CMD}" ]; then
+    # 备用方案：直接安装到 venv 目录
+    log_msg "venv creation failed, trying pip install to target directory..."
+    mkdir -p "${VENV_DIR}/lib/python3/site-packages"
+    ${PIP_CMD} install --target="${VENV_DIR}/lib/python3/site-packages" flask watchdog --no-cache-dir >>"${LOG_FILE}" 2>&1
+    if [ $? -eq 0 ]; then
+        # 创建一个简单的 python 包装器
+        cat > "${VENV_DIR}/bin/python" << 'PYEOF'
+#!/bin/sh
+export PYTHONPATH="${PYTHONPATH}:$(dirname $(dirname $0))/lib/python3/site-packages"
+exec python3 "$@"
+PYEOF
+        chmod +x "${VENV_DIR}/bin/python"
+        log_msg "Fallback python wrapper created"
+    else
+        log_msg "ERROR: Failed to install dependencies"
+        exit 1
+    fi
+elif [ -n "${PIP_CMD}" ]; then
+    log_msg "venv creation failed. Attempting direct pip install..."
+    ${PIP_CMD} install flask watchdog --no-cache-dir >>"${LOG_FILE}" 2>&1
+    if [ $? -ne 0 ]; then
+        log_msg "ERROR: Failed to install dependencies"
+        exit 1
+    fi
+    # 创建 symlink 让 cmd/main 能找到
+    mkdir -p "${VENV_DIR}/bin"
+    ln -sf "$(command -v python3)" "${VENV_DIR}/bin/python"
+    log_msg "Dependencies installed system-wide, symlink created"
+else
+    log_msg "ERROR: No pip available, cannot install dependencies"
+    exit 1
+fi
+
+# 清理缓存减小体积
+find "${VENV_DIR}" -name "*.pyc" -delete 2>/dev/null
+find "${VENV_DIR}" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null
+
+log_msg "Installation complete"
 exit 0

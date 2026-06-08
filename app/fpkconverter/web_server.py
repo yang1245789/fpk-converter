@@ -260,10 +260,12 @@ if __name__ == '__main__':
 ''')
     os.chmod(startup_script, 0o755)
     
-    cmd = [
-        os.path.join(CODE_DIR, 'venv/bin/python'),
-        startup_script
-    ]
+    # 优先使用 venv python，降级到系统 python3
+    venv_python = os.path.join(CODE_DIR, 'venv/bin/python')
+    if not os.path.exists(venv_python):
+        venv_python = 'python3'
+    
+    cmd = [venv_python, startup_script]
     
     # 使用 start_new_session=True 隔离进程组，确保子进程能被完全终止
     converter_process = subprocess.Popen(cmd, cwd=VAR_DIR, start_new_session=True)

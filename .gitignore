@@ -1,2 +1,3 @@
 *.fpk
 fnpack
+app/fpkconverter/venv/

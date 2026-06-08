@@ -6,10 +6,22 @@ APP_DIR="${TRIM_PKG}/app/fpkconverter"
 VENV_PYTHON="${APP_DIR}/venv/bin/python"
 WEB_SERVER="${APP_DIR}/web_server.py"
 
+# 如果 venv 不存在，尝试使用系统 python3
+if [ ! -f "${VENV_PYTHON}" ]; then
+    if command -v python3 &>/dev/null; then
+        VENV_PYTHON="python3"
+        # 将包目录加入 PYTHONPATH
+        export PYTHONPATH="${APP_DIR}/venv/lib/python3/site-packages:${PYTHONPATH}"
+    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - ERROR: no python found" >> "${LOG_FILE}"
+        exit 1
+    fi
+fi
+
 CMD="cd ${APP_DIR} && ${VENV_PYTHON} ${WEB_SERVER}"
 
 log_msg() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> ${LOG_FILE}
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"
 }
 
 start_process() {
@@ -17,19 +29,19 @@ start_process() {
         return 0
     fi
 
-    if [ ! -d "${APP_DIR}" ]; then
-        log_msg "ERROR: app dir not found: ${APP_DIR}"
+    if [ ! -f "${WEB_SERVER}" ]; then
+        log_msg "ERROR: web_server.py not found: ${WEB_SERVER}"
         exit 1
     fi
 
-    log_msg "Starting process ..."
-    bash -c "${CMD}" >> ${LOG_FILE} 2>&1 &
-    printf "%s" "$!" > ${PID_FILE}
+    log_msg "Starting process with: ${VENV_PYTHON}"
+    bash -c "${CMD}" >> "${LOG_FILE}" 2>&1 &
+    printf "%s" "$!" > "${PID_FILE}"
     log_msg "pid = $!"
 
-    sleep 1
+    sleep 2
     if ! check_process "$(cat ${PID_FILE})"; then
-        log_msg "ERROR: process died immediately"
+        log_msg "ERROR: process died immediately, check ${LOG_FILE}"
         rm -f "${PID_FILE}"
         exit 1
     fi
@@ -41,44 +53,35 @@ stop_process() {
 
     if [ -r "${PID_FILE}" ]; then
         pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
-        
         log_msg "pid=${pid}"
+        
         if ! check_process "${pid}"; then
             rm -f "${PID_FILE}"
-            log_msg "remove pid file"
             return
         fi
 
-        log_msg "send TERM signal to PID:${pid}..."
-        kill -TERM ${pid} >> ${LOG_FILE} 2>&1
+        log_msg "send TERM to PID:${pid}..."
+        kill -TERM ${pid} >> "${LOG_FILE}" 2>&1
 
         local count=0
         while check_process "${pid}" && [ $count -lt 10 ]; do
             sleep 1
             count=$((count + 1))
-            log_msg "waiting process terminal... (${count}s/10s)"
         done
 
         if check_process "${pid}"; then
-            log_msg "send KILL signal to PID:${pid}..."
+            log_msg "send KILL to PID:${pid}..."
             kill -KILL "${pid}"
             sleep 1
-        else
-            log_msg "process killed... "
         fi
         rm -f "${PID_FILE}"
     fi
-
     return 0
 }
 
 check_process() {
     local pid=$1
-    if kill -0 "${pid}" 2>/dev/null; then
-        return 0
-    else
-        return 1
-    fi
+    kill -0 "${pid}" 2>/dev/null && return 0 || return 1
 }
 
 status() {
@@ -88,26 +91,18 @@ status() {
             return 0
         else
             rm -f "${PID_FILE}"
-        fi    
+        fi
     fi
     return 1
 }
 
 case $1 in
 start)
-    start_process
-    ;;
+    start_process ;;
 stop)
-    stop_process
-    ;;
+    stop_process ;;
 status)
-    if status; then 
-        exit 0
-    else 
-        exit 3
-    fi
-    ;;
+    if status; then exit 0; else exit 3; fi ;;
 *)
-    exit 1
-    ;;
+    exit 1 ;;
 esac
