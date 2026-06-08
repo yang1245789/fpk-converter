@@ -1,0 +1,102 @@
+#!/bin/bash
+
+### This script is called after the user installs the application.
+
+LOG_FILE="${TRIM_PKGVAR}/install.log"
+APP_DIR="${TRIM_PKG}/app/code"
+VENV_DIR="${APP_DIR}/venv"
+
+# Log function
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "${LOG_FILE}"
+}
+
+# Fatal error function
+fatal() {
+    log "FATAL: $1"
+    echo "ERROR: $1" >&2
+    echo "See log: ${LOG_FILE}" >&2
+    exit 1
+}
+
+log "Starting installation..."
+
+# Ensure APP_DIR exists
+if [ ! -d "${APP_DIR}" ]; then
+    fatal "APP_DIR does not exist: ${APP_DIR}"
+fi
+
+# Check Python 3
+log "Checking Python 3..."
+if ! command -v python3 &> /dev/null; then
+    fatal "python3 not found. Please install Python 3 first."
+fi
+PYTHON_VERSION=$(python3 --version 2>&1)
+log "Found: ${PYTHON_VERSION}"
+
+# Check FFmpeg
+log "Checking FFmpeg..."
+if command -v ffmpeg &> /dev/null; then
+    FFMPEG_PATH=$(which ffmpeg)
+    FFMPEG_VERSION=$(ffmpeg -version 2>&1 | head -n 1)
+    log "FFmpeg found at: ${FFMPEG_PATH}"
+    log "FFmpeg version: ${FFMPEG_VERSION}"
+else
+    log "WARNING: FFmpeg not found! Transcoding will not work without FFmpeg."
+    echo "Warning: FFmpeg not found on system. Video transcoding may not work."
+fi
+
+# Set up Python virtual environment
+log "Setting up Python virtual environment at: ${VENV_DIR}"
+cd "${APP_DIR}" || fatal "Failed to cd to ${APP_DIR}"
+
+if [ ! -d "${VENV_DIR}" ]; then
+    log "Creating new venv..."
+    python3 -m venv venv >> "${LOG_FILE}" 2>&1
+    if [ $? -ne 0 ]; then
+        fatal "Failed to create virtual environment"
+    fi
+fi
+
+# shellcheck disable=SC1091
+source venv/bin/activate || fatal "Failed to activate venv"
+
+# Verify pip works
+log "Verifying pip..."
+if ! command -v pip &> /dev/null; then
+    fatal "pip not available in venv"
+fi
+
+log "Upgrading pip..."
+pip install --upgrade pip >> "${LOG_FILE}" 2>&1
+if [ $? -ne 0 ]; then
+    log "WARNING: pip upgrade failed, continuing anyway"
+fi
+
+# Install Python dependencies
+log "Installing Python dependencies from requirements.txt..."
+if [ ! -f "requirements.txt" ]; then
+    fatal "requirements.txt not found in ${APP_DIR}"
+fi
+pip install -r requirements.txt >> "${LOG_FILE}" 2>&1
+if [ $? -ne 0 ]; then
+    fatal "Failed to install Python dependencies. Check ${LOG_FILE} for details."
+fi
+
+# Verify critical imports
+log "Verifying critical imports..."
+python3 -c "import flask; import watchdog; print(f'  flask={flask.__version__}')" >> "${LOG_FILE}" 2>&1
+if [ $? -ne 0 ]; then
+    fatal "Critical Python modules missing after install"
+fi
+
+# Make sure scripts are executable
+log "Setting executable permissions..."
+chmod +x fpk_converter.py 2>/dev/null
+chmod +x view_log.py 2>/dev/null
+chmod +x web_server.py 2>/dev/null
+
+deactivate
+
+log "Installation completed successfully!"
+exit 0

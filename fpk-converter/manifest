@@ -1,0 +1,10 @@
+appname               = fpk-converter
+version               = 1.0.0
+display_name          = 视频自动转码工具
+desc                  = 自动监测文件夹、转码视频并优化存储空间，支持多种格式，转码后自动比较大小并记录日志
+arch                  = x86_64
+source                = thirdparty
+maintainer            = FPK Converter
+distributor           = FPK Converter
+desktop_uidir         = ui
+desktop_applaunchname = fpk-converter.Application
