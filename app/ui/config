@@ -2,12 +2,13 @@
     ".url": {
         "fpkconverter.Application": {
             "title": "视频转码",
-            "icon": "images/icon_{0}.png",
-            "type": "url",
+            "desc": "视频自动转码工具",
+            "icon": "images/icon.png",
+            "type": "iframe",
             "protocol": "http",
             "port": "5000",
             "url": "/",
-            "allUsers": false
+            "allUsers": true
         }
     }
 }

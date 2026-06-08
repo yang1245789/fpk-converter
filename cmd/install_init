@@ -1,5 +1,3 @@
 #!/bin/bash
-
-### This script is called before the user installs the application.
-
+# 安装初始化
 exit 0

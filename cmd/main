@@ -1,50 +1,93 @@
-#!/bin/sh
-# 飞牛应用启动/停止/状态脚本 - 使用 bundled venv
+#!/bin/bash
+# 飞牛应用启动/停止/状态脚本
+# 参照论坛 node_exporter 成功案例
 
-LOG="${TRIM_PKGVAR}/info.log"
-PID="${TRIM_PKGVAR}/app.pid"
 APP_DIR="${TRIM_PKG}/app/fpkconverter"
-PYTHON="${APP_DIR}/venv/bin/python3"
-WEB="${APP_DIR}/web_server.py"
+PKG_DIR="${APP_DIR}/packages"
+WEB_SERVER="${APP_DIR}/web_server.py"
+LOG_FILE="${TRIM_PKGVAR}/info.log"
+PID_FILE="${TRIM_PKGVAR}/app.pid"
+
 mkdir -p "${TRIM_PKGVAR}"
 
-log(){ echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG}"; }
-alive(){ kill -0 "$1" 2>/dev/null; }
+log_msg() {
+    echo -e "$(date +'%Y/%m/%d %H:%M:%S')\t$*" >> "${LOG_FILE}"
+}
+
+check_process() {
+    local pid=$1
+    kill -0 "${pid}" 2>/dev/null && return 0 || return 1
+}
+
+find_process() {
+    ps -fe | grep 'web_server\.py' | grep -v grep | grep -v tail | wc -l
+}
 
 case $1 in
 start)
-    if [ -f "${PID}" ] && alive "$(cat "${PID}")"; then
-        log "Already running"; exit 0
+    processNum=$(find_process)
+    if [ "${processNum}" -ne 0 ]; then
+        log_msg "Already running"
+        exit 0
     fi
-    if [ ! -f "${PYTHON}" ]; then
-        log "ERROR: bundled python not found at ${PYTHON}"; exit 1
+
+    if [ ! -f "${WEB_SERVER}" ]; then
+        log_msg "ERROR: ${WEB_SERVER} not found"
+        exit 1
     fi
-    log "Starting with bundled python: ${PYTHON}"
-    cd "${APP_DIR}" && "${PYTHON}" "${WEB}" >> "${LOG}" 2>&1 &
-    echo "$!" > "${PID}"
-    log "Started, pid=$!"
-    sleep 1
-    if ! alive "$(cat "${PID}")"; then
-        log "ERROR: process died, last 5 log lines:"
-        tail -5 "${LOG}" >> "${LOG}"
-        rm -f "${PID}"; exit 1
+
+    if [ ! -d "${PKG_DIR}" ]; then
+        log_msg "ERROR: packages dir not found"
+        exit 1
     fi
-    exit 0
+
+    cd "${APP_DIR}"
+    export PYTHONPATH="${PKG_DIR}:${PYTHONPATH}"
+    log_msg "Starting with PYTHONPATH=${PKG_DIR}"
+
+    nohup python3 "${WEB_SERVER}" >> "${LOG_FILE}" 2>&1 &
+    RETVAL=$?
+
+    if [ ${RETVAL} -eq 0 ]; then
+        echo "$!" > "${PID_FILE}"
+        log_msg "Started ok, pid=$!"
+        exit 0
+    else
+        log_msg "Start failed"
+        exit 1
+    fi
     ;;
+
 stop)
-    if [ -f "${PID}" ]; then
-        p=$(cat "${PID}")
-        log "Stopping pid=${p}..."
-        kill -TERM "${p}" 2>/dev/null
-        c=0; while alive "${p}" && [ $c -lt 10 ]; do sleep 1; c=$((c+1)); done
-        alive "${p}" && kill -KILL "${p}" 2>/dev/null
-        rm -f "${PID}"
+    log_msg "Stopping..."
+    if [ -f "${PID_FILE}" ]; then
+        pid=$(cat "${PID_FILE}")
+        if check_process "${pid}"; then
+            kill -TERM "${pid}" 2>/dev/null
+            local c=0
+            while check_process "${pid}" && [ $c -lt 10 ]; do
+                sleep 1; c=$((c+1))
+            done
+            check_process "${pid}" && kill -KILL "${pid}" 2>/dev/null
+        fi
+        rm -f "${PID_FILE}"
     fi
+    # 兜底：确保没有残留进程
+    pkill -f 'web_server\.py' 2>/dev/null
     exit 0
     ;;
+
 status)
-    if [ -f "${PID}" ] && alive "$(cat "${PID}")"; then exit 0; fi
-    rm -f "${PID}"; exit 3
+    processNum=$(find_process)
+    if [ "${processNum}" -ne 0 ]; then
+        exit 0
+    else
+        rm -f "${PID_FILE}"
+        exit 3
+    fi
     ;;
-*) exit 1 ;;
+
+*)
+    exit 1
+    ;;
 esac
