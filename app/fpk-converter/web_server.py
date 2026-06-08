@@ -35,7 +35,7 @@ def internal_error(error):
 # Get environment variables
 PKG_DIR = os.environ.get('TRIM_PKG', '/app')
 VAR_DIR = os.environ.get('TRIM_PKGVAR', '/var/lib/fpk-converter')
-CODE_DIR = os.path.join(PKG_DIR, 'app', 'code')
+CODE_DIR = os.path.join(PKG_DIR, 'app', 'fpk-converter')
 DB_PATH = os.path.join(VAR_DIR, 'fpk_converter.db')
 CONFIG_PATH = os.path.join(VAR_DIR, 'config.json')
 
