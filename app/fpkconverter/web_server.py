@@ -257,6 +257,16 @@ def api_browse():
             try:
                 if os.path.isdir(vol):
                     entries.append({'name':os.path.basename(vol), 'path':vol, 'is_dir':True})
+                else:
+                    # 卷存在但不是目录，也显示出来
+                    try:
+                        os.lstat(vol)
+                        entries.append({'name':os.path.basename(vol), 'path':vol, 'is_dir':True, 'no_access':True})
+                    except Exception:
+                        pass
+            except PermissionError:
+                # 权限不足，仍然显示该卷，标记为无权限
+                entries.append({'name':os.path.basename(vol), 'path':vol, 'is_dir':True, 'no_access':True})
             except: pass
         return jsonify({'path':'/', 'entries':entries})
     entries = []
@@ -272,8 +282,10 @@ def api_browse():
                 except PermissionError:
                     entries.append({'name':item, 'path':full, 'is_dir':True, 'no_access':True})
                 except: pass
+        else:
+            return jsonify({'error':'目录不存在或无权限访问'}), 403
     except PermissionError:
-        pass
+        return jsonify({'error':'无权限访问此目录'}), 403
     except Exception as e:
         return jsonify({'error':str(e)}), 500
     return jsonify({'path':p, 'entries':entries})
@@ -306,7 +318,7 @@ function saveCfg(){let d={monitor_dir:el('monitor_dir').value,crf:parseInt(el('c
 async function refresh(){try{let s=await fetch('/api/status').then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});let b=el('badge');b.textContent=s.running?'运行中':'已停止';b.className='badge '+(s.running?'bg':'br');s.config&&(el('monitor_dir').value=s.config.monitor_dir,el('crf').value=s.config.crf,el('preset').value=s.config.preset,el('threads').value=s.config.threads,el('codec').value=s.config.codec,el('container').value=s.config.container,el('use_gpu').checked=s.config.use_gpu!==false);let l=await fetch('/api/logs').then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});el('ts').textContent=l.total_saved_mb;el('tc2').textContent=l.logs.length;let t=el('tb');t.innerHTML='';l.logs.forEach(r=>{let tr=document.createElement('tr');['filepath','file_size_mb','saved_size_mb'].forEach(k=>{let td=document.createElement('td');td.textContent=r[k];tr.appendChild(td)});let sd=document.createElement('td');sd.textContent=r.success?'成功':'失败';sd.className=r.success?'suc':'err';tr.appendChild(sd);let td=document.createElement('td');td.textContent=r.processed_at;tr.appendChild(td);t.appendChild(tr)})}catch(e){console.error('refresh error:',e)}}
 function el(id){return document.getElementById(id)}
 var browsePath='/';
-async function openBrowser(p){if(p)browsePath=p;try{let d=await fetch('/api/browse?path='+encodeURIComponent(browsePath)).then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});if(d.error){alert(d.error);return}let m=el('modal'),lst=el('blist');el('bpath').textContent=d.path;lst.innerHTML='';if(d.path!=='/'){let b=document.createElement('div');b.className='bitem';b.textContent='.. 返回上级';b.onclick=()=>openBrowser(d.path.split('/').slice(0,-1).join('/')||'/');lst.appendChild(b)}d.entries.forEach(e=>{let b=document.createElement('div');b.className='bitem';b.textContent=e.name+(e.is_dir?'/':'');if(e.no_access){b.style.opacity='0.4';b.title='无权限'}else if(e.is_dir){b.onclick=()=>openBrowser(e.path)}else{b.style.opacity='0.5'}lst.appendChild(b)});m.style.display='flex'}catch(e){alert('浏览目录失败: '+e.message)}}
+async function openBrowser(p){if(p)browsePath=p;try{let d=await fetch('/api/browse?path='+encodeURIComponent(browsePath)).then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});if(d.error){alert(d.error);return}let m=el('modal'),lst=el('blist');el('bpath').textContent=d.path;lst.innerHTML='';if(d.path!=='/'){let b=document.createElement('div');b.className='bitem';b.textContent='.. 返回上级';b.onclick=()=>openBrowser(d.path.split('/').slice(0,-1).join('/')||'/');lst.appendChild(b)}d.entries.forEach(e=>{let b=document.createElement('div');b.className='bitem';b.textContent=e.name+(e.is_dir?'/':'');if(e.no_access){b.style.opacity='0.4';b.title='无权限';if(e.is_dir)b.onclick=()=>alert('无权限访问此目录')}else if(e.is_dir){b.onclick=()=>openBrowser(e.path)}else{b.style.opacity='0.5'}lst.appendChild(b)});m.style.display='flex'}catch(e){alert('浏览目录失败: '+e.message)}}
 function selectDir(){el('monitor_dir').value=browsePath;el('modal').style.display='none';saveCfg()}
 refresh();setInterval(refresh,5000)</script>
 <div id="modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:999;align-items:center;justify-content:center"><div style="background:#fff;border-radius:12px;width:90%;max-width:500px;max-height:70vh;display:flex;flex-direction:column"><div style="padding:16px 20px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;align-items:center"><span id="bpath" style="font-weight:600;font-size:14px">/</span><div><button class="btn bt2" style="padding:6px 14px;font-size:13px" onclick="selectDir()">选择此目录</button><button class="btn bt3" style="padding:6px 14px;font-size:13px;margin-left:6px" onclick="el('modal').style.display='none'">关闭</button></div></div><div id="blist" style="overflow-y:auto;flex:1;padding:8px 12px"></div></div></div>
