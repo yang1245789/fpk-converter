@@ -19,7 +19,19 @@ DB_PATH     = os.path.join(VAR_DIR, 'fpk_converter.db')
 CONFIG_PATH = os.path.join(VAR_DIR, 'config.json')
 
 import subprocess, sqlite3, time, json, threading
-from flask import Flask, render_template_string, request, jsonify
+
+# === Flask 导入 (带崩溃诊断) ===
+CRASH_LOG = os.path.join(VAR_DIR, 'crash.log')
+try:
+    from flask import Flask, render_template_string, request, jsonify
+except Exception as _e:
+    with open(CRASH_LOG, 'a') as f:
+        f.write(f'FLASK_IMPORT_ERROR: {_e}\n')
+        f.write(f'SYS_PATH: {sys.path}\n')
+        f.write(f'PKG_DIR: {PKG_DIR} exists={os.path.isdir(PKG_DIR)}\n')
+        if os.path.isdir(PKG_DIR):
+            f.write(f'PKG_CONTENTS: {os.listdir(PKG_DIR)[:20]}\n')
+    raise
 
 app = Flask(__name__)
 
