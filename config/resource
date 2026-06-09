@@ -1,1 +1,28 @@
-{}
+{
+    "data-share":
+    {
+        "shares":
+        [
+            {
+                "name": "fpkconverter",
+                "permission":
+                {
+                    "rw":
+                    [
+                        "fpkconverter"
+                    ]
+                }
+            },
+            {
+                "name": "fpkconverter/data",
+                "permission":
+                {
+                    "rw":
+                    [
+                        "fpkconverter"
+                    ]
+                }
+            }
+        ]
+    }
+}
