@@ -1,6 +1,5 @@
 #!/bin/bash
-PACKAGE_BASE="${TRIM_APPDEST}"
-[ -z "${PACKAGE_BASE}" ] && PACKAGE_BASE="${TRIM_PKG}"
+PACKAGE_BASE="${TRIM_PKG}"
 
 APP_DIR="${PACKAGE_BASE}/app/fpkconverter"
 WEB="${APP_DIR}/web_server.py"
