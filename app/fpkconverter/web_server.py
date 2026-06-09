@@ -174,7 +174,9 @@ def api_start():
             except: pass
             conv_log_file = None
         conv_log_file = open(CONV_LOG, 'a')
-        proc = subprocess.Popen([sys.executable, sc], cwd=VAR_DIR, start_new_session=True,
+        # fnOS 中 sys.executable 可能为空，回退到 python3
+        py = sys.executable if sys.executable else 'python3'
+        proc = subprocess.Popen([py, sc], cwd=VAR_DIR, start_new_session=True,
                                 stdout=conv_log_file, stderr=subprocess.STDOUT)
     # 非阻塞健康检查：3秒后验证
     def _health_check():
@@ -252,7 +254,7 @@ def api_browse():
     entries = []
     try:
         if p == '/':
-            # 动态扫描根目录，只显示当前进程可访问的目录
+            # 动态扫描根目录，显示所有条目，权限不足标记为 no_access
             try:
                 for item in sorted(os.listdir('/')):
                     if len(entries) >= 50:
@@ -261,24 +263,41 @@ def api_browse():
                     try:
                         if os.path.isdir(full):
                             entries.append({'name':item, 'path':full, 'is_dir':True})
+                        else:
+                            entries.append({'name':item, 'path':full, 'is_dir':False})
                     except PermissionError:
+                        # 权限不足但条目存在，显示为可点击但无权限
                         entries.append({'name':item, 'path':full, 'is_dir':True, 'no_access':True})
-                    except: pass
+                    except OSError:
+                        # 其他 OS 错误（如设备未就绪），跳过
+                        pass
             except PermissionError:
                 return jsonify({'error':'无权限访问根目录'}), 403
-        elif os.path.isdir(p):
-            for item in sorted(os.listdir(p)):
-                if len(entries) >= 500:  # 限制最多返回500条
-                    break
-                full = os.path.join(p, item)
-                try:
-                    is_dir = os.path.isdir(full)
-                    entries.append({'name':item, 'path':full, 'is_dir':is_dir})
-                except PermissionError:
-                    entries.append({'name':item, 'path':full, 'is_dir':True, 'no_access':True})
-                except: pass
         else:
-            return jsonify({'error':'目录不存在或无权限访问'}), 403
+            # 非根目录：先尝试 listdir，权限不足时尝试 isdir 回退
+            try:
+                items = sorted(os.listdir(p))
+                for item in items:
+                    if len(entries) >= 500:
+                        break
+                    full = os.path.join(p, item)
+                    try:
+                        is_dir = os.path.isdir(full)
+                        entries.append({'name':item, 'path':full, 'is_dir':is_dir})
+                    except PermissionError:
+                        entries.append({'name':item, 'path':full, 'is_dir':True, 'no_access':True})
+                    except OSError:
+                        pass
+            except PermissionError:
+                # listdir 失败但路径可能是一个可访问的目录（如挂载点根）
+                # 尝试用 isdir 确认，如果是目录则返回空列表（允许进入）
+                try:
+                    if os.path.isdir(p):
+                        entries = []
+                    else:
+                        return jsonify({'error':'无权限访问此目录'}), 403
+                except Exception:
+                    return jsonify({'error':'无权限访问此目录'}), 403
     except PermissionError:
         return jsonify({'error':'无权限访问此目录'}), 403
     except Exception as e:
