@@ -1,3 +1,2 @@
-#!/bin/bash
-# 安装后回调
+#!/bin/sh
 exit 0

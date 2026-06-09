@@ -1,3 +1,2 @@
-#!/bin/bash
-# 安装初始化
+#!/bin/sh
 exit 0

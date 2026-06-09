@@ -1,59 +1,23 @@
-#!/bin/bash
-# ============================================================
-# 飞牛 cmd/main - 参照论坛node_exporter成功案例
-# 环境变量: TRIM_PKG/TRIM_APPDEST(安装目录), TRIM_PKGVAR(数据目录)
-# ============================================================
+#!/bin/sh
+# 飞牛 cmd/main - install_type=root
+# 安装路径: /var/apps/fpkconverter
 
-# 路径定位 (多层兜底)
-PACKAGE_BASE="${TRIM_PKG}"
-[ -z "${PACKAGE_BASE}" ] && PACKAGE_BASE="${TRIM_APPDEST}"
-[ -z "${PACKAGE_BASE}" ] && PACKAGE_BASE="/var/apps/fpkconverter"
+APP="/var/apps/fpkconverter/app/fpkconverter/web_server.py"
+DIR="/var/apps/fpkconverter/app/fpkconverter"
 
-APP_DIR="${PACKAGE_BASE}/app/fpkconverter"
-WEB="${APP_DIR}/web_server.py"
-PKG="${APP_DIR}/packages"
-LOG="/var/log/fpkconverter.log"
-
-# 数据目录
-mkdir -p "${TRIM_PKGVAR}" 2>/dev/null
-
-# python 路径
-PYTHON="/usr/bin/python3"
-[ ! -f "${PYTHON}" ] && PYTHON="python3"
-
-case $1 in
-start)
-    processNum=$(ps -fe 2>/dev/null | grep 'web_server\.py' | grep -v grep | grep -v tail | wc -l)
-    if [ "${processNum}" -ne 0 ]; then
-        exit 0
-    fi
-
-    [ -f "${WEB}" ] || exit 1
-    [ -d "${PKG}" ] || exit 1
-
-    cd "${APP_DIR}" || exit 1
-    export PYTHONPATH="${PKG}:${PYTHONPATH}"
-
-    nohup ${PYTHON} "${WEB}" >> "${LOG}" 2>&1 &
-    PID=$!
-
-    sleep 3
-    kill -0 "${PID}" 2>/dev/null && exit 0
+if [ "$1" = "start" ]; then
+    [ -f "$APP" ] || exit 1
+    cd "$DIR" || exit 1
+    export PYTHONPATH="$DIR/packages:$PYTHONPATH"
+    nohup python3 "$APP" > /dev/null 2>&1 &
+    sleep 2
+    ps -fe 2>/dev/null | grep -q '[w]eb_server\.py' && exit 0
     exit 1
-    ;;
-
-stop)
+elif [ "$1" = "stop" ]; then
     pkill -f 'web_server\.py' 2>/dev/null
     exit 0
-    ;;
-
-status)
-    processNum=$(ps -fe 2>/dev/null | grep 'web_server\.py' | grep -v grep | grep -v tail | wc -l)
-    [ "${processNum}" -ne 0 ] && exit 0
+elif [ "$1" = "status" ]; then
+    ps -fe 2>/dev/null | grep -q '[w]eb_server\.py' && exit 0
     exit 3
-    ;;
-
-*)
-    exit 1
-    ;;
-esac
+fi
+exit 1
