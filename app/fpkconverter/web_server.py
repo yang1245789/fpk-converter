@@ -48,6 +48,7 @@ DEFAULT = {'monitor_dir':'','crf':23,'codec':'libx264','container':'mp4',
            'preset':'medium','threads':1,'use_gpu':True,'enabled':False}
 cfg = dict(DEFAULT)
 proc = None
+conv_log_file = None  # 保持文件句柄打开
 last_error = ''
 
 def load_cfg():
@@ -143,9 +144,14 @@ def api_start():
         'vc=VideoConverter(db,c["crf"],c["codec"],c["container"],c["preset"],c["threads"],c["use_gpu"],temp_dir=c.get("temp_dir",""))\n'
         'FolderScanner(c["monitor_dir"],vc).start()')
     os.chmod(sc, 0o755)
-    log_f = open(CONV_LOG, 'a')
+    global conv_log_file
+    # 关闭之前的文件句柄
+    if conv_log_file:
+        try: conv_log_file.close()
+        except: pass
+    conv_log_file = open(CONV_LOG, 'a')
     proc = subprocess.Popen([sys.executable, sc], cwd=VAR_DIR, start_new_session=True,
-                            stdout=log_f, stderr=subprocess.STDOUT)
+                            stdout=conv_log_file, stderr=subprocess.STDOUT)
     cfg['enabled'] = True; save_cfg()
     return jsonify({'success':True})
 
@@ -236,7 +242,7 @@ HTML = '''<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <div class="s"><div class="st">转码日志</div><div class="tc"><table><thead><tr><th>文件</th><th>原大小</th><th>节省</th><th>状态</th><th>时间</th></tr></thead><tbody id="tb"></tbody></table></div></div></div></div>
 <script>
 function api(a){fetch('/api/'+a,{method:'POST'}).then(r=>r.json()).then(d=>{if(d.error){el('errmsg').textContent=d.error;el('errmsg').style.display='block'}else{el('errmsg').style.display='none'}refresh()})}
-function saveCfg(){let d={monitor_dir:el('monitor_dir').value,crf:parseInt(el('crf').value),preset:el('preset').value,threads:parseInt(el('threads').value),codec:el('codec').value,container:el('container').value,use_gpu:el('use_gpu').checked};fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(()=>alert('已保存'))}
+function saveCfg(){let d={monitor_dir:el('monitor_dir').value,crf:parseInt(el('crf').value),preset:el('preset').value,threads:parseInt(el('threads').value),codec:el('codec').value,container:el('container').value,use_gpu:el('use_gpu').checked};fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(d=>{if(d.success)alert('已保存');else alert('保存失败')})}
 async function refresh(){let s=await fetch('/api/status').then(r=>r.json()),b=el('badge');b.textContent=s.running?'运行中':'已停止';b.className='badge '+(s.running?'bg':'br');s.config&&(el('monitor_dir').value=s.config.monitor_dir,el('crf').value=s.config.crf,el('preset').value=s.config.preset,el('threads').value=s.config.threads,el('codec').value=s.config.codec,el('container').value=s.config.container,el('use_gpu').checked=s.config.use_gpu!==false);let l=await fetch('/api/logs').then(r=>r.json());el('ts').textContent=l.total_saved_mb;el('tc2').textContent=l.logs.length;let t=el('tb');t.innerHTML='';l.logs.forEach(r=>{let tr=document.createElement('tr');['filepath','file_size_mb','saved_size_mb'].forEach(k=>{let td=document.createElement('td');td.textContent=r[k];tr.appendChild(td)});let sd=document.createElement('td');sd.textContent=r.success?'成功':'失败';sd.className=r.success?'suc':'err';tr.appendChild(sd);let td=document.createElement('td');td.textContent=r.processed_at;tr.appendChild(td);t.appendChild(tr)})}
 function el(id){return document.getElementById(id)}
 var browsePath='/';
@@ -248,5 +254,13 @@ refresh();setInterval(refresh,5000)</script>
 <style>.bitem{padding:10px 12px;cursor:pointer;border-radius:6px;font-size:14px;color:#1f2937}.bitem:hover{background:#f3f4f6}</style></body></html>'''
 
 if __name__ == '__main__':
+    import signal
+    def _sigterm(sig, frame):
+        global proc
+        if proc:
+            try: proc.terminate(); proc.wait(timeout=5)
+            except: pass
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _sigterm)
     print(f'Starting on http://0.0.0.0:5000 (packages:{PKG_DIR})', flush=True)
     app.run(host='0.0.0.0', port=5000, debug=False)

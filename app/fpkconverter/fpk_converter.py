@@ -67,11 +67,14 @@ class Database:
     def is_file_processed(self, filepath):
         try:
             conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute('SELECT 1 FROM processed_files WHERE filepath = ?', (str(filepath),))
-            result = cursor.fetchone()
-            conn.close()
-            return result is not None
+            try:
+                cursor = conn.cursor()
+                cursor.execute('SELECT 1, success FROM processed_files WHERE filepath = ?', (str(filepath),))
+                result = cursor.fetchone()
+                # 只有成功处理的才算已处理（失败的允许重试）
+                return result is not None and result[1] == 1
+            finally:
+                conn.close()
         except Exception as e:
             print(f"数据库查询失败: {e}")
             return False
@@ -79,27 +82,29 @@ class Database:
     def add_processed_file(self, filepath, file_size, success, saved_size=0):
         try:
             conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT OR REPLACE INTO processed_files 
-                (filepath, file_size, success, saved_size)
-                VALUES (?, ?, ?, ?)
-            ''', (str(filepath), file_size, int(success), saved_size))
-            conn.commit()
-            conn.close()
+            try:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT OR REPLACE INTO processed_files 
+                    (filepath, file_size, success, saved_size)
+                    VALUES (?, ?, ?, ?)
+                ''', (str(filepath), file_size, int(success), saved_size))
+                conn.commit()
+            finally:
+                conn.close()
         except sqlite3.Error as e:
             print(f"数据库写入失败: {e}")
-        except Exception as e:
-            print(f"数据库异常: {e}")
 
     def get_processed_files(self):
         try:
             conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM processed_files ORDER BY processed_at DESC')
-            results = cursor.fetchall()
-            conn.close()
-            return results
+            try:
+                cursor = conn.cursor()
+                cursor.execute('SELECT * FROM processed_files ORDER BY processed_at DESC')
+                results = cursor.fetchall()
+                return results
+            finally:
+                conn.close()
         except Exception as e:
             print(f"数据库查询失败: {e}")
             return []
@@ -457,18 +462,19 @@ class VideoConverter:
         cmd.extend(['-y', str(output_path)])
 
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+            # 用文件重定向而非 capture_output，避免大文件 OOM
+            with open(self.temp_dir / f"ffmpeg_{unique_id}.log", 'w') as log_file:
+                result = subprocess.run(cmd, stdout=log_file, stderr=subprocess.STDOUT, timeout=3600)
             if result.returncode != 0:
-                # 限制错误信息长度，避免日志爆炸
-                err_msg = result.stderr[-500:] if result.stderr else 'Unknown error'
+                log_path = self.temp_dir / f"ffmpeg_{unique_id}.log"
+                try:
+                    err_msg = log_path.read_text()[-500:] if log_path.exists() else 'Unknown error'
+                except: err_msg = 'Unknown error'
                 print(f"FFmpeg 错误: {err_msg}")
                 self.db.add_processed_file(input_path, original_size, False)
-                # 清理可能的部分输出文件
                 if output_path.exists():
-                    try:
-                        output_path.unlink()
-                    except Exception:
-                        pass
+                    try: output_path.unlink()
+                    except: pass
                 return False, 0
         except subprocess.TimeoutExpired:
             print(f"FFmpeg 转码超时: {input_path}")
@@ -502,31 +508,27 @@ class VideoConverter:
 
         saved_size = original_size - converted_size
         if converted_size < original_size:
-            print(f"转码后更小，删除原文件，保留转码文件，节省 {saved_size / (1024*1024):.2f} MB")
-            try:
-                input_path.unlink()
-                print(f"已删除原文件: {input_path}")
-            except Exception as e:
-                print(f"删除原文件失败: {e}")
-            
+            print(f"转码后更小，节省 {saved_size / (1024*1024):.2f} MB")
             final_output_path = input_path.parent / f"{input_path.stem}.{self.container}"
-            # 如果目标文件已存在，先删除
+            # 先重命名转码文件到最终位置（原子操作）
             if final_output_path.exists():
-                try:
-                    final_output_path.unlink()
-                except Exception:
-                    pass
+                try: final_output_path.unlink()
+                except: pass
             try:
                 output_path.rename(final_output_path)
             except Exception as e:
                 print(f"重命名输出文件失败: {e}")
                 if output_path.exists():
-                    try:
-                        output_path.unlink()
-                    except Exception:
-                        pass
+                    try: output_path.unlink()
+                    except: pass
                 return False, 0
-            self.db.add_processed_file(input_path, original_size, True, saved_size)
+            # 重命名成功后才删除原文件（防止数据丢失）
+            try:
+                input_path.unlink()
+                print(f"已替换原文件: {input_path}")
+            except Exception as e:
+                print(f"删除原文件失败(转码文件已保留): {e}")
+            self.db.add_processed_file(str(final_output_path), original_size, True, saved_size)
             return True, saved_size
         else:
             print(f"转码后更大或相同，删除转码文件，保留原文件")

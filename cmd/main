@@ -3,8 +3,8 @@
 # 事实: cmd在/var/apps/fpkconverter/, app在/vol2/@appcenter/fpkconverter/
 # 通过 target 软链接找到 app 目录
 
-LOG="/vol2/@appdata/fpkconverter/info.log"
-mkdir -p /vol2/@appdata/fpkconverter 2>/dev/null
+LOG="${TRIM_PKGVAR:-/tmp}/fpkconverter/info.log"
+mkdir -p "$(dirname "$LOG")" 2>/dev/null
 
 echo "=== $(date) arg=$1 ===" >> "$LOG"
 
@@ -53,7 +53,7 @@ if [ -n "$APP_DIR" ]; then
     ls -la "$APP_DIR/" >> "$LOG" 2>&1
 fi
 
-VAR="${TRIM_PKGVAR:-/vol2/@appdata/fpkconverter}"
+VAR="${TRIM_PKGVAR:-/tmp/fpkconverter}"
 mkdir -p "$VAR" 2>/dev/null
 PID="$VAR/app.pid"
 
