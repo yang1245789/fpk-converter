@@ -6,15 +6,9 @@ import subprocess
 import time
 import json
 import threading
-import re
 import shutil
 import traceback
 from pathlib import Path
-from datetime import datetime
-
-
-# 路径校验正则
-ALLOWED_PATH_PATTERN = re.compile(r'^/[A-Za-z0-9_./\-\s]+$')
 
 
 class Database:
@@ -25,7 +19,9 @@ class Database:
             self.db_path = db_path
         # 确保数据库目录存在
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
+            db_dir = os.path.dirname(os.path.abspath(self.db_path))
+            if db_dir:
+                os.makedirs(db_dir, exist_ok=True)
         except Exception:
             pass
         self._init_database()
@@ -45,22 +41,24 @@ class Database:
     def _init_database(self):
         try:
             conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS processed_files (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    filepath TEXT UNIQUE NOT NULL,
-                    file_size INTEGER NOT NULL,
-                    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    success INTEGER DEFAULT 0,
-                    saved_size INTEGER DEFAULT 0
-                )
-            ''')
-            cursor.execute('''
-                CREATE INDEX IF NOT EXISTS idx_filepath ON processed_files (filepath)
-            ''')
-            conn.commit()
-            conn.close()
+            try:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS processed_files (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        filepath TEXT UNIQUE NOT NULL,
+                        file_size INTEGER NOT NULL,
+                        processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        success INTEGER DEFAULT 0,
+                        saved_size INTEGER DEFAULT 0
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE INDEX IF NOT EXISTS idx_filepath ON processed_files (filepath)
+                ''')
+                conn.commit()
+            finally:
+                conn.close()
         except Exception as e:
             print(f"数据库初始化失败: {e}")
 
@@ -119,7 +117,7 @@ class VideoConverter:
     MAX_BITRATE = 13 * 1000 * 1000
     SKIP_THRESHOLD = 10 * 1000 * 1000
     TRANSCODE_DELAY = 900
-    TEMP_MAX_GB = 30  # 临时文件总大小上限
+    TEMP_MAX_GB = 30
 
     def __init__(self, db, target_quality=23, codec='libx264', container='mp4',
                  preset='medium', threads=1, use_gpu=True, temp_dir=''):
@@ -130,15 +128,12 @@ class VideoConverter:
         self.preset = preset if preset in self.ALLOWED_PRESETS else 'medium'
         self.threads = max(1, min(16, int(threads)))
         self.use_gpu = bool(use_gpu)
-        # 临时目录（不写系统分区）
         self.temp_dir = Path(temp_dir) if temp_dir else None
         if self.temp_dir and not self.temp_dir.exists():
             self.temp_dir.mkdir(parents=True, exist_ok=True)
-        # 串行处理队列（单线程顺序执行）
         self._queue = []
         self._queue_lock = threading.Lock()
         self._worker_running = False
-        # 去重
         self.recent_events = {}
         self.event_lock = threading.Lock()
 
@@ -153,25 +148,22 @@ class VideoConverter:
             return None
         if not filepath.is_file():
             return None
-        # 拒绝隐藏文件（以 . 开头）
         if filepath.name.startswith('.'):
             return None
-        # 拒绝包含路径遍历
         if '..' in str(filepath):
             return None
         return filepath
 
-    def _deduplicate_event(self, filepath_str, debounce_seconds=5):
+    def _deduplicate_event(self, filepath_str, debounce_seconds=60):
         """事件去重：相同文件在 debounce_seconds 内的事件合并"""
         with self.event_lock:
             now = time.time()
             last_time = self.recent_events.get(filepath_str, 0)
             if now - last_time < debounce_seconds:
-                return False  # 重复事件，跳过
+                return False
             self.recent_events[filepath_str] = now
-            # 清理过期记录
             if len(self.recent_events) > 200:
-                cutoff = now - 60
+                cutoff = now - 300
                 self.recent_events = {k: v for k, v in self.recent_events.items() if v > cutoff}
             return True
 
@@ -189,21 +181,25 @@ class VideoConverter:
             return None
         
         cmd = [
-            'ffprobe',
-            '-v', 'quiet',
+            'ffprobe', '-v', 'quiet',
             '-print_format', 'json',
-            '-show_format',
-            '-show_streams',
+            '-show_format', '-show_streams',
             str(filepath)
         ]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            # 重定向到临时文件避免 OOM
+            log_file = self.temp_dir / f"ffprobe_{os.getpid()}_{int(time.time())}.log" if self.temp_dir else None
+            if log_file:
+                with open(log_file, 'w') as lf:
+                    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=lf, timeout=60)
+            else:
+                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60)
+            
             if result.returncode != 0:
                 return None
             try:
                 info = json.loads(result.stdout)
-            except json.JSONDecodeError as e:
-                print(f"ffprobe 输出解析失败: {e}")
+            except json.JSONDecodeError:
                 return None
             
             video_stream = None
@@ -221,20 +217,14 @@ class VideoConverter:
             
             bit_rate_str = video_stream.get('bit_rate')
             if not bit_rate_str:
-                format_info = info.get('format', {})
-                bit_rate_str = format_info.get('bit_rate')
+                bit_rate_str = info.get('format', {}).get('bit_rate')
             
             try:
                 bit_rate = int(bit_rate_str) if bit_rate_str else 0
             except (ValueError, TypeError):
                 bit_rate = 0
             
-            return {
-                'width': width,
-                'height': height,
-                'codec': codec,
-                'bit_rate': bit_rate
-            }
+            return {'width': width, 'height': height, 'codec': codec, 'bit_rate': bit_rate}
         except subprocess.TimeoutExpired:
             print(f"ffprobe 超时: {filepath}")
             return None
@@ -248,19 +238,15 @@ class VideoConverter:
     def should_skip_transcode(self, video_info):
         if not video_info:
             return False
-        
         codec = video_info.get('codec', '').lower()
         height = video_info.get('height', 0)
         bit_rate = video_info.get('bit_rate', 0)
-        
         is_hevc = codec in ['hevc', 'h265', 'h.265']
         is_1080p = height == 1080
         is_low_bitrate = bit_rate > 0 and bit_rate < self.SKIP_THRESHOLD
-        
         if is_hevc and is_1080p and is_low_bitrate:
             print(f"检测到 1080p HEVC 视频，码率 {bit_rate / 1000000:.2f} Mbps < 10 Mbps，跳过转码")
             return True
-        
         return False
 
     def queue_file(self, filepath):
@@ -270,19 +256,14 @@ class VideoConverter:
             return
         
         filepath_str = str(filepath)
-        # 事件去重
         if not self._deduplicate_event(filepath_str):
             return
         
         with self._queue_lock:
-            # 检查队列里是否已有此文件
             for item in self._queue:
                 if item['path'] == filepath_str:
                     return
-            self._queue.append({
-                'path': filepath_str,
-                'queued_at': time.time()
-            })
+            self._queue.append({'path': filepath_str, 'queued_at': time.time()})
             print(f"文件加入串行队列({len(self._queue)}): {filepath_str}")
         
         self._ensure_worker()
@@ -310,17 +291,15 @@ class VideoConverter:
             filepath_str = item['path']
             filepath = Path(filepath_str)
             
-            # 等待延迟期
+            # 等待延迟期，每 5 秒检查一次文件是否还存在
             wait_start = time.time()
             while time.time() - wait_start < self.TRANSCODE_DELAY:
-                with self._queue_lock:
-                    if not self._worker_running:
-                        return
+                if not os.path.exists(filepath_str):
+                    print(f"文件在等待期间被删除，跳过: {filepath_str}")
+                    break
                 time.sleep(5)
             
-            # 检查文件是否还存在且未被修改
             if not os.path.exists(filepath_str):
-                print(f"文件已删除，跳过: {filepath_str}")
                 continue
             
             try:
@@ -328,18 +307,13 @@ class VideoConverter:
                 if mtime > item['queued_at']:
                     print(f"文件在等待期间被修改，重新入队: {filepath_str}")
                     with self._queue_lock:
-                        self._queue.append({
-                            'path': filepath_str,
-                            'queued_at': time.time()
-                        })
+                        self._queue.append({'path': filepath_str, 'queued_at': time.time()})
                     continue
             except Exception:
                 pass
             
-            # 检查并清理临时目录
             self._enforce_temp_limit()
             
-            # 串行执行转码
             try:
                 print(f"[SERIAL] 开始处理: {filepath_str}")
                 self.convert_video(filepath)
@@ -347,7 +321,6 @@ class VideoConverter:
                 print(f"转码异常: {e}")
                 traceback.print_exc()
             
-            # 每个文件之间短暂间隔
             time.sleep(2)
 
     def _enforce_temp_limit(self):
@@ -362,7 +335,6 @@ class VideoConverter:
                     sz = f.stat().st_size
                     total += sz
                     files.append((f, sz))
-            # 按修改时间排序（旧→新）
             files.sort(key=lambda x: x[0].stat().st_mtime)
             limit = self.TEMP_MAX_GB * 1024 * 1024 * 1024
             for f, sz in files:
@@ -417,27 +389,22 @@ class VideoConverter:
             self.db.add_processed_file(input_path, original_size, True, 0)
             return True, 0
         
-        if self.use_gpu:
-            target_codec = 'hevc_qsv'
-        else:
-            target_codec = 'libx265'
+        target_codec = 'hevc_qsv' if self.use_gpu else 'libx265'
         
         target_width, target_height = width, height
         needs_resize = False
         
-        if height >= 1080:
-            if height > 1080:
-                target_height = 1080
-                target_width = int(width * 1080 / height)
-                target_width = target_width - (target_width % 2)
-                if target_width < 2:
-                    target_width = 2
-                needs_resize = True
-                print(f"缩放分辨率: {width}x{height} -> {target_width}x{target_height}")
+        if height >= 1080 and height > 1080:
+            target_height = 1080
+            target_width = int(width * 1080 / height)
+            target_width = target_width - (target_width % 2)
+            if target_width < 2:
+                target_width = 2
+            needs_resize = True
+            print(f"缩放分辨率: {width}x{height} -> {target_width}x{target_height}")
         
         print(f"开始转码: {input_path} (大小: {original_size / (1024*1024):.2f} MB)")
 
-        # 临时文件写入安装目录下的 temp/（不污染视频源目录，不写系统分区）
         unique_id = f"{os.getpid()}_{int(time.time())}"
         if self.temp_dir and self.temp_dir.is_dir():
             output_path = self.temp_dir / f"{input_path.stem}_temp_{unique_id}.{self.container}"
@@ -463,13 +430,18 @@ class VideoConverter:
 
         try:
             # 用文件重定向而非 capture_output，避免大文件 OOM
-            with open(self.temp_dir / f"ffmpeg_{unique_id}.log", 'w') as log_file:
-                result = subprocess.run(cmd, stdout=log_file, stderr=subprocess.STDOUT, timeout=3600)
+            ffmpeg_log = self.temp_dir / f"ffmpeg_{unique_id}.log" if self.temp_dir else None
+            if ffmpeg_log:
+                with open(ffmpeg_log, 'w') as log_file:
+                    result = subprocess.run(cmd, stdout=log_file, stderr=subprocess.STDOUT, timeout=3600)
+            else:
+                result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3600)
+            
             if result.returncode != 0:
-                log_path = self.temp_dir / f"ffmpeg_{unique_id}.log"
-                try:
-                    err_msg = log_path.read_text()[-500:] if log_path.exists() else 'Unknown error'
-                except: err_msg = 'Unknown error'
+                err_msg = 'Unknown error'
+                if ffmpeg_log and ffmpeg_log.exists():
+                    try: err_msg = ffmpeg_log.read_text()[-500:]
+                    except: pass
                 print(f"FFmpeg 错误: {err_msg}")
                 self.db.add_processed_file(input_path, original_size, False)
                 if output_path.exists():
@@ -479,10 +451,8 @@ class VideoConverter:
         except subprocess.TimeoutExpired:
             print(f"FFmpeg 转码超时: {input_path}")
             if output_path.exists():
-                try:
-                    output_path.unlink()
-                except Exception:
-                    pass
+                try: output_path.unlink()
+                except: pass
             self.db.add_processed_file(input_path, original_size, False)
             return False, 0
         except FileNotFoundError:
@@ -497,10 +467,8 @@ class VideoConverter:
         converted_size = self.get_file_size(output_path)
         if converted_size is None or converted_size == 0:
             if output_path.exists():
-                try:
-                    output_path.unlink()
-                except Exception:
-                    pass
+                try: output_path.unlink()
+                except: pass
             self.db.add_processed_file(input_path, original_size, False)
             return False, 0
 
@@ -510,7 +478,6 @@ class VideoConverter:
         if converted_size < original_size:
             print(f"转码后更小，节省 {saved_size / (1024*1024):.2f} MB")
             final_output_path = input_path.parent / f"{input_path.stem}.{self.container}"
-            # 先重命名转码文件到最终位置（原子操作）
             if final_output_path.exists():
                 try: final_output_path.unlink()
                 except: pass
@@ -532,10 +499,8 @@ class VideoConverter:
             return True, saved_size
         else:
             print(f"转码后更大或相同，删除转码文件，保留原文件")
-            try:
-                output_path.unlink()
-            except Exception:
-                pass
+            try: output_path.unlink()
+            except: pass
             self.db.add_processed_file(input_path, original_size, True, 0)
             return True, 0
 
@@ -552,23 +517,30 @@ class FolderScanner:
 
     def start(self):
         print(f"开始定时扫描: {self.folder_path} (间隔{self.interval}秒)")
-        self._scan()
+        self._scan(self.folder_path)
         while not self._stop.is_set():
             self._stop.wait(self.interval)
             if not self._stop.is_set():
-                self._scan()
+                self._scan(self.folder_path)
 
     def stop(self):
         self._stop.set()
 
-    def _scan(self):
+    def _scan(self, directory):
+        """递归扫描目录"""
         try:
-            for item in self.folder_path.iterdir():
+            for item in directory.iterdir():
                 try:
-                    if item.is_file() and self.converter.is_video_file(item):
+                    if item.is_dir():
+                        self._scan(item)
+                    elif item.is_file() and self.converter.is_video_file(item):
                         self.converter.queue_file(item)
+                except PermissionError:
+                    pass
                 except Exception as e:
                     print(f"扫描文件失败: {e}")
+        except PermissionError:
+            pass
         except Exception as e:
             print(f"扫描目录失败: {e}")
 

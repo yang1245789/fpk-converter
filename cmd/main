@@ -60,7 +60,10 @@ PID="$VAR/app.pid"
 check() {
     [ -f "$PID" ] || return 1
     p=$(head -n1 "$PID" 2>/dev/null | tr -d '[:space:]')
-    [ -n "$p" ] && kill -0 "$p" 2>/dev/null
+    [ -z "$p" ] && { rm -f "$PID"; return 1; }
+    kill -0 "$p" 2>/dev/null && return 0
+    rm -f "$PID"
+    return 1
 }
 
 case $1 in
@@ -75,8 +78,11 @@ start)
     fi
     cd "$APP_DIR" || { echo "FAIL cd" >> "$LOG"; exit 1; }
     export PYTHONPATH="$APP_DIR/packages:$PYTHONPATH"
-    echo "Starting python3 at $APP_DIR" >> "$LOG"
-    python3 web_server.py >> "$VAR/app.log" 2>&1 &
+    # 尝试 python3，回退到 python
+    PYTHON="python3"
+    command -v python3 >/dev/null 2>&1 || PYTHON="python"
+    echo "Starting $PYTHON at $APP_DIR" >> "$LOG"
+    $PYTHON web_server.py >> "$VAR/app.log" 2>&1 &
     echo $! > "$PID"
     echo "Started PID=$!" >> "$LOG"
     exit 0

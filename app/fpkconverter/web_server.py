@@ -48,8 +48,9 @@ DEFAULT = {'monitor_dir':'','crf':23,'codec':'libx264','container':'mp4',
            'preset':'medium','threads':1,'use_gpu':True,'enabled':False}
 cfg = dict(DEFAULT)
 proc = None
-conv_log_file = None  # 保持文件句柄打开
+conv_log_file = None
 last_error = ''
+proc_lock = threading.Lock()
 
 def load_cfg():
     global cfg
@@ -67,14 +68,30 @@ def save_cfg():
     except: pass
 
 def init_db():
-    c = sqlite3.connect(DB_PATH)
-    c.execute('''CREATE TABLE IF NOT EXISTS processed_files(
-        id INTEGER PRIMARY KEY AUTOINCREMENT, filepath TEXT UNIQUE NOT NULL,
-        file_size INTEGER NOT NULL, processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        success INTEGER DEFAULT 0, saved_size INTEGER DEFAULT 0)''')
-    c.commit(); c.close()
+    try:
+        c = sqlite3.connect(DB_PATH)
+        try:
+            c.execute('''CREATE TABLE IF NOT EXISTS processed_files(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, filepath TEXT UNIQUE NOT NULL,
+                file_size INTEGER NOT NULL, processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                success INTEGER DEFAULT 0, saved_size INTEGER DEFAULT 0)''')
+            c.commit()
+        finally:
+            c.close()
+    except Exception as e:
+        print(f"init_db error: {e}")
 
 load_cfg(); init_db()
+
+def _is_running():
+    """安全地检查子进程是否存活"""
+    global proc
+    if proc is None:
+        return False
+    try:
+        return proc.poll() is None
+    except Exception:
+        return False
 
 @app.route('/')
 def index(): return render_template_string(HTML, config=cfg, var_dir=VAR_DIR, conv_log=CONV_LOG, db_path=DB_PATH)
@@ -106,75 +123,95 @@ def api_cfg():
 @app.route('/api/status')
 def api_status():
     global last_error
-    running = proc is not None and proc.poll() is None
-    return jsonify({'running':running, 'config':cfg, 'error':last_error})
+    return jsonify({'running':_is_running(), 'config':cfg, 'error':last_error})
 
 TEMP_DIR = os.path.join(SCRIPT_DIR, 'temp')
 
 @app.route('/api/start', methods=['POST'])
 def api_start():
-    global proc, last_error
-    last_error = ''
-    if proc and proc.poll() is None:
-        return jsonify({'success':False, 'error':'已在运行中'})
-    md = cfg.get('monitor_dir','')
-    if not md or not md.startswith('/') or '..' in md:
-        last_error = '请先选择监控文件夹'
-        return jsonify({'success':False, 'error':last_error})
-    if not os.path.isdir(md):
-        last_error = f'目录不存在: {md}'
-        return jsonify({'success':False, 'error':last_error})
-    os.makedirs(TEMP_DIR, exist_ok=True)
-    jp = os.path.join(VAR_DIR, 'start_config.json')
-    with open(jp,'w') as f: json.dump({
-        'db_path':DB_PATH, 'code_dir':SCRIPT_DIR, 'monitor_dir':md,
-        'crf':cfg.get('crf',23), 'codec':cfg.get('codec','libx264'),
-        'container':cfg.get('container','mp4'), 'preset':cfg.get('preset','medium'),
-        'threads':cfg.get('threads',1), 'use_gpu':cfg.get('use_gpu',True),
-        'temp_dir': TEMP_DIR}, f)
-    sc = os.path.join(VAR_DIR, 'start_converter.py')
-    with open(sc,'w') as f: f.write(
-        'import sys,os,json\nj=os.path.join;sd=os.path.dirname(os.path.abspath(__file__))\n'
-        'jv=os.environ.get("TRIM_PKGVAR") or os.path.join(os.path.dirname(os.path.abspath(__file__)),"..","app","fpkconverter","data")\n'
-        'with open(j(jv,"start_config.json")) as f:c=json.load(f)\n'
-        'sd=c["code_dir"];sys.path.insert(0,sd)\n'
-        'pk=j(sd,"packages")\nif os.path.isdir(pk):sys.path.insert(0,pk)\n'
-        'from fpk_converter import Database,VideoConverter,FolderScanner\n'
-        'db=Database(c["db_path"])\n'
-        'vc=VideoConverter(db,c["crf"],c["codec"],c["container"],c["preset"],c["threads"],c["use_gpu"],temp_dir=c.get("temp_dir",""))\n'
-        'FolderScanner(c["monitor_dir"],vc).start()')
-    os.chmod(sc, 0o755)
-    global conv_log_file
-    # 关闭之前的文件句柄
-    if conv_log_file:
-        try: conv_log_file.close()
-        except: pass
-    conv_log_file = open(CONV_LOG, 'a')
-    proc = subprocess.Popen([sys.executable, sc], cwd=VAR_DIR, start_new_session=True,
-                            stdout=conv_log_file, stderr=subprocess.STDOUT)
-    cfg['enabled'] = True; save_cfg()
-    return jsonify({'success':True})
+    global proc, last_error, conv_log_file
+    with proc_lock:
+        last_error = ''
+        if _is_running():
+            return jsonify({'success':False, 'error':'已在运行中'})
+        md = cfg.get('monitor_dir','')
+        if not md or not md.startswith('/') or '..' in md:
+            last_error = '请先选择监控文件夹'
+            return jsonify({'success':False, 'error':last_error})
+        if not os.path.isdir(md):
+            last_error = f'目录不存在: {md}'
+            return jsonify({'success':False, 'error':last_error})
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        jp = os.path.join(VAR_DIR, 'start_config.json')
+        with open(jp,'w') as f: json.dump({
+            'db_path':DB_PATH, 'code_dir':SCRIPT_DIR, 'monitor_dir':md,
+            'crf':cfg.get('crf',23), 'codec':cfg.get('codec','libx264'),
+            'container':cfg.get('container','mp4'), 'preset':cfg.get('preset','medium'),
+            'threads':cfg.get('threads',1), 'use_gpu':cfg.get('use_gpu',True),
+            'temp_dir': TEMP_DIR}, f)
+        sc = os.path.join(VAR_DIR, 'start_converter.py')
+        with open(sc,'w') as f: f.write(
+            'import sys,os,json\n'
+            'sd=os.path.dirname(os.path.abspath(__file__))\n'
+            'jv=os.environ.get("TRIM_PKGVAR") or os.path.join(sd,"..","app","fpkconverter","data")\n'
+            'with open(os.path.join(jv,"start_config.json")) as fh:c=json.load(fh)\n'
+            'sys.path.insert(0,c["code_dir"])\n'
+            'pk=os.path.join(c["code_dir"],"packages")\n'
+            'if os.path.isdir(pk):sys.path.insert(0,pk)\n'
+            'from fpk_converter import Database,VideoConverter,FolderScanner\n'
+            'db=Database(c["db_path"])\n'
+            'vc=VideoConverter(db,c["crf"],c["codec"],c["container"],c["preset"],c["threads"],c["use_gpu"],temp_dir=c.get("temp_dir",""))\n'
+            'FolderScanner(c["monitor_dir"],vc).start()')
+        os.chmod(sc, 0o755)
+        # 关闭之前的文件句柄
+        if conv_log_file:
+            try: conv_log_file.close()
+            except: pass
+            conv_log_file = None
+        conv_log_file = open(CONV_LOG, 'a')
+        proc = subprocess.Popen([sys.executable, sc], cwd=VAR_DIR, start_new_session=True,
+                                stdout=conv_log_file, stderr=subprocess.STDOUT)
+        # 健康检查：等 2 秒看进程是否存活
+        time.sleep(2)
+        if not _is_running():
+            last_error = '转码进程启动后立刻退出，请检查日志'
+            if conv_log_file:
+                try: conv_log_file.close()
+                except: pass
+                conv_log_file = None
+            proc = None
+            return jsonify({'success':False, 'error':last_error})
+        cfg['enabled'] = True; save_cfg()
+        return jsonify({'success':True})
 
 @app.route('/api/stop', methods=['POST'])
 def api_stop():
-    global proc, last_error
-    last_error = ''
-    if proc:
-        try: proc.terminate(); proc.wait(timeout=10)
-        except:
-            try: proc.kill(); proc.wait(timeout=5)
+    global proc, last_error, conv_log_file
+    with proc_lock:
+        last_error = ''
+        if proc:
+            try: proc.terminate(); proc.wait(timeout=10)
+            except:
+                try: proc.kill(); proc.wait(timeout=5)
+                except: pass
+            proc = None
+        if conv_log_file:
+            try: conv_log_file.close()
             except: pass
-        proc = None
-    cfg['enabled'] = False; save_cfg()
+            conv_log_file = None
+        cfg['enabled'] = False; save_cfg()
     return jsonify({'success':True})
 
 @app.route('/api/logs')
 def api_logs():
+    rows = []
     try:
         db = sqlite3.connect(DB_PATH)
-        rows = db.execute('SELECT * FROM processed_files ORDER BY processed_at DESC LIMIT 100').fetchall()
-        db.close()
-    except: rows = []
+        try:
+            rows = db.execute('SELECT * FROM processed_files ORDER BY processed_at DESC LIMIT 100').fetchall()
+        finally:
+            db.close()
+    except: pass
     logs, total = [], 0
     for r in rows:
         logs.append({'id':r[0],'filepath':str(r[1]),'file_size':r[2],
@@ -198,7 +235,7 @@ def api_browse():
         for vol in SAFE_ROOTS:
             try:
                 if os.path.isdir(vol):
-                    entries.append({'name':vol+'/', 'path':vol, 'is_dir':True})
+                    entries.append({'name':os.path.basename(vol), 'path':vol, 'is_dir':True})
             except: pass
         return jsonify({'path':'/', 'entries':entries})
     entries = []
@@ -256,9 +293,12 @@ refresh();setInterval(refresh,5000)</script>
 if __name__ == '__main__':
     import signal
     def _sigterm(sig, frame):
-        global proc
+        global proc, conv_log_file
         if proc:
             try: proc.terminate(); proc.wait(timeout=5)
+            except: pass
+        if conv_log_file:
+            try: conv_log_file.close()
             except: pass
         sys.exit(0)
     signal.signal(signal.SIGTERM, _sigterm)
