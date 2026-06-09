@@ -2,37 +2,138 @@
 
 LOG_FILE="${TRIM_PKGVAR}/info.log"
 PID_FILE="${TRIM_PKGVAR}/app.pid"
+DIAG_FILE="${TRIM_PKGVAR}/diag.log"
 
 APP_DIR="${TRIM_PKG}/app/fpkconverter"
-CMD="cd ${APP_DIR} && export PYTHONPATH=${APP_DIR}/packages:${PYTHONPATH} && /usr/bin/python3 ${APP_DIR}/web_server.py"
+PKG="${APP_DIR}/packages"
+WEB="${APP_DIR}/web_server.py"
 
 log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> ${LOG_FILE}
 }
 
+# ============================================================
+# 诊断：逐项验证所有启动前提
+# ============================================================
+run_diagnostics() {
+    local diag_ok=0
+    {
+        echo "========== $(date) 诊断开始 =========="
+        echo "TRIM_PKG    = ${TRIM_PKG}"
+        echo "TRIM_PKGVAR = ${TRIM_PKGVAR}"
+        echo "APP_DIR     = ${APP_DIR}"
+        echo ""
+
+        # 1. python3
+        PYTHON=""
+        for py in /usr/bin/python3 /usr/local/bin/python3 /bin/python3 python3; do
+            if command -v "$py" >/dev/null 2>&1; then
+                echo "[OK] python3 found: $py"
+                PYTHON="$py"
+                break
+            fi
+        done
+        if [ -z "${PYTHON}" ]; then
+            echo "[FAIL] python3 NOT FOUND"
+            diag_ok=1
+        else
+            echo "  version: $(${PYTHON} --version 2>&1)"
+        fi
+
+        # 2. APP_DIR
+        if [ -d "${APP_DIR}" ]; then
+            echo "[OK] APP_DIR: ${APP_DIR}"
+        else
+            echo "[FAIL] APP_DIR missing: ${APP_DIR}"
+            ls -la "${TRIM_PKG}/app/" 2>&1 || true
+            diag_ok=1
+        fi
+
+        # 3. packages
+        if [ -d "${PKG}" ]; then
+            echo "[OK] packages: ${PKG}"
+            echo "  files: $(find "${PKG}" -type f 2>/dev/null | wc -l)"
+        else
+            echo "[FAIL] packages missing: ${PKG}"
+            ls -la "${APP_DIR}/" 2>&1 || true
+            diag_ok=1
+        fi
+
+        # 4. web_server.py
+        if [ -f "${WEB}" ]; then
+            echo "[OK] web_server.py: ${WEB}"
+            echo "  size: $(wc -c < "${WEB}") bytes"
+        else
+            echo "[FAIL] web_server.py missing: ${WEB}"
+            ls -la "${APP_DIR}/" 2>&1 || true
+            diag_ok=1
+        fi
+
+        # 5. flask import test
+        if [ -n "${PYTHON}" ] && [ -d "${PKG}" ]; then
+            local out
+            out=$(PYTHONPATH="${PKG}" ${PYTHON} -c "import flask; print('flask', flask.__version__)" 2>&1)
+            local rc=$?
+            if [ $rc -eq 0 ]; then
+                echo "[OK] flask import: ${out}"
+            else
+                echo "[FAIL] flask import FAILED (rc=$rc)"
+                echo "  PYTHONPATH=${PKG}"
+                echo "  error: ${out}"
+                diag_ok=1
+            fi
+        fi
+
+        if [ $diag_ok -eq 0 ]; then
+            echo "[OK] All diagnostics PASSED"
+        else
+            echo "[FAIL] Diagnostics found ${diag_ok} error(s)"
+        fi
+    } >> "${DIAG_FILE}" 2>&1
+
+    return ${diag_ok}
+}
+
+CMD="cd ${APP_DIR} && export PYTHONPATH=${PKG}:\${PYTHONPATH:-} && exec python3 ${WEB}"
+
 start_process() {
-    if status; then
+    run_diagnostics
+    if [ $? -ne 0 ]; then
+        log_msg "DIAGNOSTICS FAILED - check ${DIAG_FILE}"
+        return 1
+    fi
+
+    if status_impl; then
         return 0
     fi
 
-    log_msg "Starting process ..."
+    log_msg "Starting: ${CMD}"
     bash -c "${CMD}" >> ${LOG_FILE} 2>&1 &
-    printf "%s" "$!" > ${PID_FILE}
-    return 0
+    local pid=$!
+    printf "%s" "${pid}" > ${PID_FILE}
+    log_msg "started PID=${pid}"
+
+    sleep 1
+    if check_process "${pid}"; then
+        log_msg "process alive after 1s"
+        return 0
+    fi
+    log_msg "process DIED within 1s - check ${LOG_FILE}"
+    return 1
 }
 
 stop_process() {
-    log_msg "Stopping process ..."
+    log_msg "Stopping ..."
 
     if [ -r "${PID_FILE}" ]; then
         pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
 
         if ! check_process "${pid}"; then
             rm -f "${PID_FILE}"
-            return
+            return 0
         fi
 
-        log_msg "send TERM to PID:${pid}..."
+        log_msg "send TERM to PID:${pid}"
         kill -TERM ${pid} >> ${LOG_FILE} 2>&1
 
         local count=0
@@ -42,7 +143,7 @@ stop_process() {
         done
 
         if check_process "${pid}"; then
-            log_msg "send KILL to PID:${pid}..."
+            log_msg "send KILL to PID:${pid}"
             kill -KILL "${pid}"
             sleep 1
         fi
@@ -57,7 +158,7 @@ check_process() {
     kill -0 "${pid}" 2>/dev/null && return 0 || return 1
 }
 
-status() {
+status_impl() {
     if [ -f "${PID_FILE}" ]; then
         pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
         if check_process "${pid}"; then
@@ -66,7 +167,6 @@ status() {
             rm -f "${PID_FILE}"
         fi
     fi
-
     return 1
 }
 
@@ -78,7 +178,7 @@ stop)
     stop_process
     ;;
 status)
-    if status; then
+    if status_impl; then
         exit 0
     else
         exit 3
