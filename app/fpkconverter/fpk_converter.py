@@ -11,8 +11,6 @@ import shutil
 import traceback
 from pathlib import Path
 from datetime import datetime
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
 
 
 # 路径校验正则
@@ -540,52 +538,28 @@ class VideoConverter:
             return True, 0
 
 
-class FolderMonitor:
-    def __init__(self, folder_path, converter):
+class FolderScanner:
+    """定时扫描模式（不使用 watchdog inotify，避免 NAS 崩溃）"""
+    def __init__(self, folder_path, converter, interval=60):
         self.folder_path = Path(folder_path).resolve()
         if not self.folder_path.is_dir():
             raise ValueError(f"监控路径不存在或不是目录: {self.folder_path}")
         self.converter = converter
-        self.observer = Observer()
-
-    class Handler(FileSystemEventHandler):
-        def __init__(self, converter):
-            self.converter = converter
-
-        def on_created(self, event):
-            if not event.is_directory:
-                self._safe_process_file(Path(event.src_path))
-
-        def on_modified(self, event):
-            if not event.is_directory:
-                self._safe_process_file(Path(event.src_path))
-
-        def _safe_process_file(self, filepath):
-            """带异常保护的文件处理"""
-            try:
-                if self.converter.is_video_file(filepath):
-                    self.converter.queue_file(filepath)
-            except Exception as e:
-                print(f"处理文件事件失败: {e}")
+        self.interval = max(10, interval)
+        self._stop = threading.Event()
 
     def start(self):
-        event_handler = self.Handler(self.converter)
-        self.observer.schedule(event_handler, str(self.folder_path), recursive=False)
-        self.observer.start()
-        print(f"开始监控文件夹: {self.folder_path}")
-        print(f"延迟转码时间: {self.converter.TRANSCODE_DELAY} 秒")
-        
-        self._scan_existing_files()
+        print(f"开始定时扫描: {self.folder_path} (间隔{self.interval}秒)")
+        self._scan()
+        while not self._stop.is_set():
+            self._stop.wait(self.interval)
+            if not self._stop.is_set():
+                self._scan()
 
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            self.observer.stop()
-        self.observer.join()
+    def stop(self):
+        self._stop.set()
 
-    def _scan_existing_files(self):
-        print("扫描现有文件...")
+    def _scan(self):
         try:
             for item in self.folder_path.iterdir():
                 try:
@@ -610,8 +584,8 @@ def main():
     try:
         db = Database()
         converter = VideoConverter(db)
-        monitor = FolderMonitor(folder_path, converter)
-        monitor.start()
+        scanner = FolderScanner(folder_path, converter)
+        scanner.start()
     except KeyboardInterrupt:
         print("\n用户中断")
     except Exception as e:

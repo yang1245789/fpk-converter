@@ -146,10 +146,10 @@ def api_start():
         'with open(j(jv,"start_config.json")) as f:c=json.load(f)\n'
         'sd=c["code_dir"];sys.path.insert(0,sd)\n'
         'pk=j(sd,"packages")\nif os.path.isdir(pk):sys.path.insert(0,pk)\n'
-        'from fpk_converter import Database,VideoConverter,FolderMonitor\n'
+        'from fpk_converter import Database,VideoConverter,FolderScanner\n'
         'db=Database(c["db_path"])\n'
         'vc=VideoConverter(db,c["crf"],c["codec"],c["container"],c["preset"],c["threads"],c["use_gpu"],temp_dir=c.get("temp_dir",""))\n'
-        'FolderMonitor(c["monitor_dir"],vc).start()')
+        'FolderScanner(c["monitor_dir"],vc).start()')
     os.chmod(sc, 0o755)
     proc = subprocess.Popen([sys.executable, sc], cwd=VAR_DIR, start_new_session=True)
     cfg['enabled'] = True; save_cfg()
@@ -183,6 +183,24 @@ def api_logs():
         total += r[5] or 0
     return jsonify({'logs':logs,'total_saved_mb':round(total/1048576,2)})
 
+@app.route('/api/browse')
+def api_browse():
+    p = request.args.get('path', '/')
+    if not p.startswith('/') or '..' in p:
+        return jsonify({'error':'Invalid path'}), 400
+    try:
+        entries = []
+        if os.path.isdir(p):
+            for item in sorted(os.listdir(p)):
+                full = os.path.join(p, item)
+                try:
+                    is_dir = os.path.isdir(full)
+                    entries.append({'name':item, 'path':full, 'is_dir':is_dir})
+                except: pass
+        return jsonify({'path':p, 'entries':entries})
+    except Exception as e:
+        return jsonify({'error':str(e)}), 500
+
 HTML = '''<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>视频自动转码工具</title><style>
@@ -192,7 +210,7 @@ HTML = '''<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <div class="bg2"><button class="btn bt2" onclick="api('start')">启动</button>
 <button class="btn bt3" onclick="api('stop')">停止</button></div></div>
 <div class="s"><div class="st">配置</div>
-<div class="fg"><label>监控文件夹</label><input type="text" id="monitor_dir" value="{{config.monitor_dir}}"></div>
+<div class="fg"><label>监控文件夹</label><div style="display:flex;gap:8px"><input type="text" id="monitor_dir" value="{{config.monitor_dir}}"><button class="btn bt1" style="padding:9px 14px;white-space:nowrap" onclick="openBrowser()">浏览</button></div></div>
 <div class="fg"><label>CRF (18-28)</label><input type="number" id="crf" min="18" max="28" value="{{config.crf}}"></div>
 <div class="fg"><label>编码预设</label><select id="preset">{% for p in ['ultrafast','superfast','veryfast','faster','fast','medium','slow','slower','veryslow'] %}<option value="{{p}}" {%if p==config.preset%}selected{%endif%}>{{p}}</option>{%endfor%}</select></div>
 <div class="fg"><label>线程</label><input type="number" id="threads" min="1" max="8" value="{{config.threads}}"></div>
@@ -202,10 +220,18 @@ HTML = '''<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <button class="btn bt1" onclick="saveCfg()">保存配置</button></div>
 <div class="s"><div class="st">统计</div><div class="stats"><div class="sc"><div class="sv" id="ts">0</div><div class="sl">节省(MB)</div></div><div class="sc"><div class="sv" id="tc2">0</div><div class="sl">处理文件</div></div></div></div>
 <div class="s"><div class="st">日志</div><div class="tc"><table><thead><tr><th>文件</th><th>原大小</th><th>节省</th><th>状态</th><th>时间</th></tr></thead><tbody id="tb"></tbody></table></div></div></div></div>
-<script>function api(a){fetch('/api/'+a,{method:'POST'}).then(r=>r.json()).then(d=>refresh())}
+<script>
+function api(a){fetch('/api/'+a,{method:'POST'}).then(r=>r.json()).then(d=>refresh())}
 function saveCfg(){let d={monitor_dir:el('monitor_dir').value,crf:parseInt(el('crf').value),preset:el('preset').value,threads:parseInt(el('threads').value),codec:el('codec').value,container:el('container').value,use_gpu:el('use_gpu').checked};fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(()=>alert('已保存'))}
 async function refresh(){let s=await fetch('/api/status').then(r=>r.json()),b=el('badge');b.textContent=s.running?'运行中':'已停止';b.className='badge '+(s.running?'bg':'br');s.config&&(el('monitor_dir').value=s.config.monitor_dir,el('crf').value=s.config.crf,el('preset').value=s.config.preset,el('threads').value=s.config.threads,el('codec').value=s.config.codec,el('container').value=s.config.container,el('use_gpu').checked=s.config.use_gpu!==false);let l=await fetch('/api/logs').then(r=>r.json());el('ts').textContent=l.total_saved_mb;el('tc2').textContent=l.logs.length;let t=el('tb');t.innerHTML='';l.logs.forEach(r=>{let tr=document.createElement('tr');['filepath','file_size_mb','saved_size_mb'].forEach(k=>{let td=document.createElement('td');td.textContent=r[k];tr.appendChild(td)});let sd=document.createElement('td');sd.textContent=r.success?'成功':'失败';sd.className=r.success?'suc':'err';tr.appendChild(sd);let td=document.createElement('td');td.textContent=r.processed_at;tr.appendChild(td);t.appendChild(tr)})}
-function el(id){return document.getElementById(id)}refresh();setInterval(refresh,5000)</script></body></html>'''
+function el(id){return document.getElementById(id)}
+var browsePath='/';
+async function openBrowser(p){if(p)browsePath=p;let d=await fetch('/api/browse?path='+encodeURIComponent(browsePath)).then(r=>r.json());if(d.error){alert(d.error);return}let m=el('modal'),lst=el('blist');el('bpath').textContent=d.path;lst.innerHTML='';if(d.path!=='/'){let b=document.createElement('div');b.className='bitem';b.textContent='.. 返回上级';b.onclick=()=>openBrowser(d.path.split('/').slice(0,-1).join('/')||'/');lst.appendChild(b)}d.entries.forEach(e=>{let b=document.createElement('div');b.className='bitem';b.textContent=e.name+(e.is_dir?'/':'');if(e.is_dir)b.onclick=()=>openBrowser(e.path);else b.style.opacity='0.5';lst.appendChild(b)});m.style.display='flex'}
+function selectDir(){el('monitor_dir').value=browsePath;el('modal').style.display='none'}
+function el(id){return document.getElementById(id)}
+refresh();setInterval(refresh,5000)</script>
+<div id="modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:999;align-items:center;justify-content:center"><div style="background:#fff;border-radius:12px;width:90%;max-width:500px;max-height:70vh;display:flex;flex-direction:column"><div style="padding:16px 20px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;align-items:center"><span id="bpath" style="font-weight:600;font-size:14px">/</span><div><button class="btn bt2" style="padding:6px 14px;font-size:13px" onclick="selectDir()">选择此目录</button><button class="btn bt3" style="padding:6px 14px;font-size:13px;margin-left:6px" onclick="el('modal').style.display='none'">关闭</button></div></div><div id="blist" style="overflow-y:auto;flex:1;padding:8px 12px"></div></div></div>
+<style>.bitem{padding:10px 12px;cursor:pointer;border-radius:6px;font-size:14px;color:#1f2937}.bitem:hover{background:#f3f4f6}</style></body></html>'''
 
 if __name__ == '__main__':
     print(f'Starting on http://0.0.0.0:5000 (packages:{PKG_DIR})', flush=True)
