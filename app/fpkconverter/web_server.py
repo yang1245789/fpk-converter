@@ -84,7 +84,6 @@ def init_db():
 load_cfg(); init_db()
 
 def _is_running():
-    """安全地检查子进程是否存活"""
     global proc
     if proc is None:
         return False
@@ -157,13 +156,13 @@ def api_start():
             'with open(os.path.join(jv,"start_config.json")) as fh:c=json.load(fh)\n'
             'sys.path.insert(0,c["code_dir"])\n'
             'pk=os.path.join(c["code_dir"],"packages")\n'
-            'if os.path.isdir(pk):sys.path.insert(0,pk)\n'
+            'if os.path.isdir(pk):\n'
+            '    sys.path.insert(0,pk)\n'
             'from fpk_converter import Database,VideoConverter,FolderScanner\n'
             'db=Database(c["db_path"])\n'
             'vc=VideoConverter(db,c["crf"],c["codec"],c["container"],c["preset"],c["threads"],c["use_gpu"],temp_dir=c.get("temp_dir",""))\n'
             'FolderScanner(c["monitor_dir"],vc).start()')
         os.chmod(sc, 0o755)
-        # 关闭之前的文件句柄
         if conv_log_file:
             try: conv_log_file.close()
             except: pass
@@ -171,16 +170,18 @@ def api_start():
         conv_log_file = open(CONV_LOG, 'a')
         proc = subprocess.Popen([sys.executable, sc], cwd=VAR_DIR, start_new_session=True,
                                 stdout=conv_log_file, stderr=subprocess.STDOUT)
-        # 健康检查：等 2 秒看进程是否存活
-        time.sleep(2)
-        if not _is_running():
-            last_error = '转码进程启动后立刻退出，请检查日志'
-            if conv_log_file:
-                try: conv_log_file.close()
-                except: pass
-                conv_log_file = None
-            proc = None
-            return jsonify({'success':False, 'error':last_error})
+        # 非阻塞健康检查：2秒后验证
+        def _health_check():
+            global proc, last_error, conv_log_file
+            time.sleep(2)
+            if not _is_running():
+                last_error = '转码进程启动后立刻退出，请检查日志'
+                if conv_log_file:
+                    try: conv_log_file.close()
+                    except: pass
+                    conv_log_file = None
+                proc = None
+        threading.Thread(target=_health_check, daemon=True).start()
         cfg['enabled'] = True; save_cfg()
         return jsonify({'success':True})
 
@@ -221,7 +222,6 @@ def api_logs():
         total += r[5] or 0
     return jsonify({'logs':logs,'total_saved_mb':round(total/1048576,2)})
 
-# === 目录浏览：只显示存储卷 ===
 SAFE_ROOTS = ['/vol1','/vol2','/vol3','/vol4','/vol5','/vol6','/vol7','/vol8']
 
 @app.route('/api/browse')
@@ -229,7 +229,6 @@ def api_browse():
     p = request.args.get('path', '/')
     if not p.startswith('/') or '..' in p:
         return jsonify({'error':'Invalid path'}), 400
-    # 根目录只显示存储卷
     if p == '/':
         entries = []
         for vol in SAFE_ROOTS:
@@ -285,7 +284,6 @@ function el(id){return document.getElementById(id)}
 var browsePath='/';
 async function openBrowser(p){if(p)browsePath=p;let d=await fetch('/api/browse?path='+encodeURIComponent(browsePath)).then(r=>r.json());if(d.error){alert(d.error);return}let m=el('modal'),lst=el('blist');el('bpath').textContent=d.path;lst.innerHTML='';if(d.path!=='/'){let b=document.createElement('div');b.className='bitem';b.textContent='.. 返回上级';b.onclick=()=>openBrowser(d.path.split('/').slice(0,-1).join('/')||'/');lst.appendChild(b)}d.entries.forEach(e=>{let b=document.createElement('div');b.className='bitem';b.textContent=e.name+(e.is_dir?'/':'');if(e.no_access){b.style.opacity='0.4';b.title='无权限'}else if(e.is_dir){b.onclick=()=>openBrowser(e.path)}else{b.style.opacity='0.5'}lst.appendChild(b)});m.style.display='flex'}
 function selectDir(){el('monitor_dir').value=browsePath;el('modal').style.display='none';saveCfg()}
-function el(id){return document.getElementById(id)}
 refresh();setInterval(refresh,5000)</script>
 <div id="modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:999;align-items:center;justify-content:center"><div style="background:#fff;border-radius:12px;width:90%;max-width:500px;max-height:70vh;display:flex;flex-direction:column"><div style="padding:16px 20px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;align-items:center"><span id="bpath" style="font-weight:600;font-size:14px">/</span><div><button class="btn bt2" style="padding:6px 14px;font-size:13px" onclick="selectDir()">选择此目录</button><button class="btn bt3" style="padding:6px 14px;font-size:13px;margin-left:6px" onclick="el('modal').style.display='none'">关闭</button></div></div><div id="blist" style="overflow-y:auto;flex:1;padding:8px 12px"></div></div></div>
 <style>.bitem{padding:10px 12px;cursor:pointer;border-radius:6px;font-size:14px;color:#1f2937}.bitem:hover{background:#f3f4f6}</style></body></html>'''

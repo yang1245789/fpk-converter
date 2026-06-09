@@ -17,7 +17,6 @@ class Database:
             self.db_path = 'fpk_converter.db'
         else:
             self.db_path = db_path
-        # 确保数据库目录存在
         try:
             db_dir = os.path.dirname(os.path.abspath(self.db_path))
             if db_dir:
@@ -27,7 +26,6 @@ class Database:
         self._init_database()
 
     def _get_connection(self):
-        """获取数据库连接，包含重试机制"""
         max_retries = 3
         for i in range(max_retries):
             try:
@@ -69,7 +67,6 @@ class Database:
                 cursor = conn.cursor()
                 cursor.execute('SELECT 1, success FROM processed_files WHERE filepath = ?', (str(filepath),))
                 result = cursor.fetchone()
-                # 只有成功处理的才算已处理（失败的允许重试）
                 return result is not None and result[1] == 1
             finally:
                 conn.close()
@@ -141,7 +138,6 @@ class VideoConverter:
         return filepath.suffix.lower() in self.VIDEO_EXTENSIONS
 
     def _validate_path(self, filepath):
-        """校验文件路径安全性"""
         try:
             filepath = Path(filepath).resolve()
         except (OSError, ValueError, RuntimeError):
@@ -155,7 +151,6 @@ class VideoConverter:
         return filepath
 
     def _deduplicate_event(self, filepath_str, debounce_seconds=60):
-        """事件去重：相同文件在 debounce_seconds 内的事件合并"""
         with self.event_lock:
             now = time.time()
             last_time = self.recent_events.get(filepath_str, 0)
@@ -175,7 +170,6 @@ class VideoConverter:
             return None
 
     def get_video_info(self, filepath):
-        """使用 ffprobe 获取视频信息"""
         filepath = self._validate_path(filepath)
         if not filepath:
             return None
@@ -187,7 +181,6 @@ class VideoConverter:
             str(filepath)
         ]
         try:
-            # 重定向到临时文件避免 OOM
             log_file = self.temp_dir / f"ffprobe_{os.getpid()}_{int(time.time())}.log" if self.temp_dir else None
             if log_file:
                 with open(log_file, 'w') as lf:
@@ -198,8 +191,9 @@ class VideoConverter:
             if result.returncode != 0:
                 return None
             try:
-                info = json.loads(result.stdout)
-            except json.JSONDecodeError:
+                stdout_str = result.stdout.decode('utf-8', errors='replace')
+                info = json.loads(stdout_str)
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 return None
             
             video_stream = None
@@ -250,7 +244,6 @@ class VideoConverter:
         return False
 
     def queue_file(self, filepath):
-        """将文件加入串行处理队列"""
         filepath = self._validate_path(filepath)
         if not filepath:
             return
@@ -269,7 +262,6 @@ class VideoConverter:
         self._ensure_worker()
 
     def _ensure_worker(self):
-        """确保串行工作线程在运行"""
         with self._queue_lock:
             if self._worker_running:
                 return
@@ -278,7 +270,6 @@ class VideoConverter:
         t.start()
 
     def _serial_worker(self):
-        """串行工作线程——一个接一个处理"""
         while True:
             item = None
             with self._queue_lock:
@@ -290,8 +281,8 @@ class VideoConverter:
             
             filepath_str = item['path']
             filepath = Path(filepath_str)
+            queued_at = item.get('queued_at', time.time())
             
-            # 等待延迟期，每 5 秒检查一次文件是否还存在
             wait_start = time.time()
             while time.time() - wait_start < self.TRANSCODE_DELAY:
                 if not os.path.exists(filepath_str):
@@ -304,7 +295,7 @@ class VideoConverter:
             
             try:
                 mtime = os.path.getmtime(filepath_str)
-                if mtime > item['queued_at']:
+                if mtime > queued_at:
                     print(f"文件在等待期间被修改，重新入队: {filepath_str}")
                     with self._queue_lock:
                         self._queue.append({'path': filepath_str, 'queued_at': time.time()})
@@ -324,7 +315,6 @@ class VideoConverter:
             time.sleep(2)
 
     def _enforce_temp_limit(self):
-        """确保临时目录不超过 TEMP_MAX_GB"""
         if not self.temp_dir or not self.temp_dir.is_dir():
             return
         try:
@@ -429,7 +419,6 @@ class VideoConverter:
         cmd.extend(['-y', str(output_path)])
 
         try:
-            # 用文件重定向而非 capture_output，避免大文件 OOM
             ffmpeg_log = self.temp_dir / f"ffmpeg_{unique_id}.log" if self.temp_dir else None
             if ffmpeg_log:
                 with open(ffmpeg_log, 'w') as log_file:
@@ -482,14 +471,14 @@ class VideoConverter:
                 try: final_output_path.unlink()
                 except: pass
             try:
-                output_path.rename(final_output_path)
+                # 跨设备移动用 shutil.move 替代 Path.rename
+                shutil.move(str(output_path), str(final_output_path))
             except Exception as e:
-                print(f"重命名输出文件失败: {e}")
+                print(f"移动输出文件失败: {e}")
                 if output_path.exists():
                     try: output_path.unlink()
                     except: pass
                 return False, 0
-            # 重命名成功后才删除原文件（防止数据丢失）
             try:
                 input_path.unlink()
                 print(f"已替换原文件: {input_path}")
@@ -507,32 +496,35 @@ class VideoConverter:
 
 class FolderScanner:
     """定时扫描模式（不使用 watchdog inotify，避免 NAS 崩溃）"""
-    def __init__(self, folder_path, converter, interval=60):
+    def __init__(self, folder_path, converter, interval=60, max_depth=3):
         self.folder_path = Path(folder_path).resolve()
         if not self.folder_path.is_dir():
             raise ValueError(f"监控路径不存在或不是目录: {self.folder_path}")
         self.converter = converter
         self.interval = max(10, interval)
+        self.max_depth = max(0, max_depth)
         self._stop = threading.Event()
 
     def start(self):
-        print(f"开始定时扫描: {self.folder_path} (间隔{self.interval}秒)")
-        self._scan(self.folder_path)
+        print(f"开始定时扫描: {self.folder_path} (间隔{self.interval}秒, 最大深度{self.max_depth})")
+        self._scan(self.folder_path, 0)
         while not self._stop.is_set():
             self._stop.wait(self.interval)
             if not self._stop.is_set():
-                self._scan(self.folder_path)
+                self._scan(self.folder_path, 0)
 
     def stop(self):
         self._stop.set()
 
-    def _scan(self, directory):
-        """递归扫描目录"""
+    def _scan(self, directory, depth):
+        """递归扫描目录，限制最大深度"""
+        if depth > self.max_depth:
+            return
         try:
             for item in directory.iterdir():
                 try:
                     if item.is_dir():
-                        self._scan(item)
+                        self._scan(item, depth + 1)
                     elif item.is_file() and self.converter.is_video_file(item):
                         self.converter.queue_file(item)
                 except PermissionError:
