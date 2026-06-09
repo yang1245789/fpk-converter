@@ -8,7 +8,8 @@ import os, sys
 # === 路径自检测 (不依赖 TRIM_PKG/TRIM_PKGVAR) ===
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))   # .../app/fpkconverter
 PKG_DIR    = os.path.join(SCRIPT_DIR, 'packages')          # .../app/fpkconverter/packages
-VAR_DIR    = os.environ.get('TRIM_PKGVAR', '/var/lib/fpkconverter')
+# VAR_DIR: 优先 TRIM_PKGVAR(数据卷)，其次安装目录下的 data/，绝不碰 /var/lib
+VAR_DIR    = os.environ.get('TRIM_PKGVAR') or os.path.join(SCRIPT_DIR, 'data')
 os.makedirs(VAR_DIR, exist_ok=True)
 
 # 将 packages 加入 Python 搜索路径
@@ -106,6 +107,8 @@ def api_status():
     running = proc is not None and proc.poll() is None
     return jsonify({'running':running, 'config':cfg})
 
+TEMP_DIR = os.path.join(SCRIPT_DIR, 'temp')
+
 @app.route('/api/start', methods=['POST'])
 def api_start():
     global proc
@@ -115,21 +118,24 @@ def api_start():
     if not md.startswith('/') or '..' in md:
         return jsonify({'success':False, 'error':'Invalid path'}), 400
     os.makedirs(md, exist_ok=True)
+    os.makedirs(TEMP_DIR, exist_ok=True)
     jp = os.path.join(VAR_DIR, 'start_config.json')
     with open(jp,'w') as f: json.dump({
         'db_path':DB_PATH, 'code_dir':SCRIPT_DIR, 'monitor_dir':md,
         'crf':cfg.get('crf',23), 'codec':cfg.get('codec','libx264'),
         'container':cfg.get('container','mp4'), 'preset':cfg.get('preset','medium'),
-        'threads':cfg.get('threads',1), 'use_gpu':cfg.get('use_gpu',True)}, f)
+        'threads':cfg.get('threads',1), 'use_gpu':cfg.get('use_gpu',True),
+        'temp_dir': TEMP_DIR}, f)
     sc = os.path.join(VAR_DIR, 'start_converter.py')
     with open(sc,'w') as f: f.write(
-        'import sys,os,json\nj=os.path.join;jv=os.environ.get("TRIM_PKGVAR","/var/lib/fpkconverter")\n'
+        'import sys,os,json\nj=os.path.join;sd=os.path.dirname(os.path.abspath(__file__))\n'
+        'jv=os.environ.get("TRIM_PKGVAR") or os.path.join(os.path.dirname(os.path.abspath(__file__)),"..","app","fpkconverter","data")\n'
         'with open(j(jv,"start_config.json")) as f:c=json.load(f)\n'
         'sd=c["code_dir"];sys.path.insert(0,sd)\n'
         'pk=j(sd,"packages")\nif os.path.isdir(pk):sys.path.insert(0,pk)\n'
         'from fpk_converter import Database,VideoConverter,FolderMonitor\n'
         'db=Database(c["db_path"])\n'
-        'vc=VideoConverter(db,c["crf"],c["codec"],c["container"],c["preset"],c["threads"],c["use_gpu"])\n'
+        'vc=VideoConverter(db,c["crf"],c["codec"],c["container"],c["preset"],c["threads"],c["use_gpu"],temp_dir=c.get("temp_dir",""))\n'
         'FolderMonitor(c["monitor_dir"],vc).start()')
     os.chmod(sc, 0o755)
     proc = subprocess.Popen([sys.executable, sc], cwd=VAR_DIR, start_new_session=True)

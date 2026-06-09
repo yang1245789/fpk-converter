@@ -116,9 +116,10 @@ class VideoConverter:
     MAX_BITRATE = 13 * 1000 * 1000
     SKIP_THRESHOLD = 10 * 1000 * 1000
     TRANSCODE_DELAY = 900
-    MAX_CONCURRENT_TASKS = 50
+    TEMP_MAX_GB = 30  # 临时文件总大小上限
 
-    def __init__(self, db, target_quality=23, codec='libx264', container='mp4', preset='medium', threads=1, use_gpu=True):
+    def __init__(self, db, target_quality=23, codec='libx264', container='mp4',
+                 preset='medium', threads=1, use_gpu=True, temp_dir=''):
         self.db = db
         self.target_quality = max(1, min(51, int(target_quality)))
         self.codec = codec if codec in self.ALLOWED_CODECS else 'libx265'
@@ -126,9 +127,15 @@ class VideoConverter:
         self.preset = preset if preset in self.ALLOWED_PRESETS else 'medium'
         self.threads = max(1, min(16, int(threads)))
         self.use_gpu = bool(use_gpu)
-        self.pending_files = {}
-        self.lock = threading.Lock()
-        # 用于去重：文件最近触发时间
+        # 临时目录（不写系统分区）
+        self.temp_dir = Path(temp_dir) if temp_dir else None
+        if self.temp_dir and not self.temp_dir.exists():
+            self.temp_dir.mkdir(parents=True, exist_ok=True)
+        # 串行处理队列（单线程顺序执行）
+        self._queue = []
+        self._queue_lock = threading.Lock()
+        self._worker_running = False
+        # 去重
         self.recent_events = {}
         self.event_lock = threading.Lock()
 
@@ -254,7 +261,7 @@ class VideoConverter:
         return False
 
     def queue_file(self, filepath):
-        """将文件加入待处理队列"""
+        """将文件加入串行处理队列"""
         filepath = self._validate_path(filepath)
         if not filepath:
             return
@@ -264,58 +271,108 @@ class VideoConverter:
         if not self._deduplicate_event(filepath_str):
             return
         
-        with self.lock:
-            if len(self.pending_files) >= self.MAX_CONCURRENT_TASKS:
-                print(f"待处理队列已满（{self.MAX_CONCURRENT_TASKS}），跳过文件: {filepath}")
-                return
-            
-            self.pending_files[filepath_str] = time.time()
-            print(f"文件加入队列: {filepath_str}，等待 {self.TRANSCODE_DELAY} 秒后处理")
+        with self._queue_lock:
+            # 检查队列里是否已有此文件
+            for item in self._queue:
+                if item['path'] == filepath_str:
+                    return
+            self._queue.append({
+                'path': filepath_str,
+                'queued_at': time.time()
+            })
+            print(f"文件加入串行队列({len(self._queue)}): {filepath_str}")
         
-        thread = threading.Thread(target=self._delayed_process, args=(filepath,))
-        thread.daemon = True
-        thread.start()
+        self._ensure_worker()
 
-    def _delayed_process(self, filepath):
-        """延迟处理文件"""
-        filepath_str = str(filepath)
-        try:
-            time.sleep(self.TRANSCODE_DELAY)
-        except Exception:
-            return
-        
-        with self.lock:
-            if filepath_str not in self.pending_files:
+    def _ensure_worker(self):
+        """确保串行工作线程在运行"""
+        with self._queue_lock:
+            if self._worker_running:
                 return
+            self._worker_running = True
+        t = threading.Thread(target=self._serial_worker, daemon=True)
+        t.start()
+
+    def _serial_worker(self):
+        """串行工作线程——一个接一个处理"""
+        while True:
+            item = None
+            with self._queue_lock:
+                if self._queue:
+                    item = self._queue.pop(0)
+                else:
+                    self._worker_running = False
+                    return
+            
+            filepath_str = item['path']
+            filepath = Path(filepath_str)
+            
+            # 等待延迟期
+            wait_start = time.time()
+            while time.time() - wait_start < self.TRANSCODE_DELAY:
+                with self._queue_lock:
+                    if not self._worker_running:
+                        return
+                time.sleep(5)
+            
+            # 检查文件是否还存在且未被修改
+            if not os.path.exists(filepath_str):
+                print(f"文件已删除，跳过: {filepath_str}")
+                continue
             
             try:
-                queued_at = self.pending_files[filepath_str]
-                if not os.path.exists(filepath):
-                    print(f"文件已被删除: {filepath_str}")
-                    del self.pending_files[filepath_str]
-                    return
-                
-                mtime = os.path.getmtime(filepath)
-                if mtime > queued_at:
-                    print(f"文件在等待期间被修改，重新排队: {filepath_str}")
-                    self.pending_files[filepath_str] = time.time()
-                    threading.Thread(target=self._delayed_process, args=(filepath,)).start()
-                    return
-                
-                del self.pending_files[filepath_str]
+                mtime = os.path.getmtime(filepath_str)
+                if mtime > item['queued_at']:
+                    print(f"文件在等待期间被修改，重新入队: {filepath_str}")
+                    with self._queue_lock:
+                        self._queue.append({
+                            'path': filepath_str,
+                            'queued_at': time.time()
+                        })
+                    continue
+            except Exception:
+                pass
+            
+            # 检查并清理临时目录
+            self._enforce_temp_limit()
+            
+            # 串行执行转码
+            try:
+                print(f"[SERIAL] 开始处理: {filepath_str}")
+                self.convert_video(filepath)
             except Exception as e:
-                print(f"检查文件修改时间失败: {e}")
-                if filepath_str in self.pending_files:
-                    del self.pending_files[filepath_str]
-                return
-        
-        # 处理文件 - 顶层异常捕获，确保线程不崩
+                print(f"转码异常: {e}")
+                traceback.print_exc()
+            
+            # 每个文件之间短暂间隔
+            time.sleep(2)
+
+    def _enforce_temp_limit(self):
+        """确保临时目录不超过 TEMP_MAX_GB"""
+        if not self.temp_dir or not self.temp_dir.is_dir():
+            return
         try:
-            print(f"开始处理: {filepath_str}")
-            self.convert_video(filepath)
+            total = 0
+            files = []
+            for f in self.temp_dir.iterdir():
+                if f.is_file():
+                    sz = f.stat().st_size
+                    total += sz
+                    files.append((f, sz))
+            # 按修改时间排序（旧→新）
+            files.sort(key=lambda x: x[0].stat().st_mtime)
+            limit = self.TEMP_MAX_GB * 1024 * 1024 * 1024
+            for f, sz in files:
+                if total <= limit:
+                    break
+                try:
+                    f.unlink()
+                    total -= sz
+                    print(f"清理临时文件(超{self.TEMP_MAX_GB}GB): {f.name}")
+                except Exception as e:
+                    print(f"清理临时文件失败: {e}")
         except Exception as e:
-            print(f"处理文件时发生未预期错误: {e}")
-            traceback.print_exc()
+            print(f"检查临时目录失败: {e}")
 
     def convert_video(self, input_path):
         try:
@@ -377,9 +434,12 @@ class VideoConverter:
         
         print(f"开始转码: {input_path} (大小: {original_size / (1024*1024):.2f} MB)")
 
-        # 使用 PID + 时间戳生成唯一输出文件名，避免冲突
+        # 临时文件写入安装目录下的 temp/（不污染视频源目录，不写系统分区）
         unique_id = f"{os.getpid()}_{int(time.time())}"
-        output_path = input_path.parent / f"{input_path.stem}_temp_{unique_id}.{self.container}"
+        if self.temp_dir and self.temp_dir.is_dir():
+            output_path = self.temp_dir / f"{input_path.stem}_temp_{unique_id}.{self.container}"
+        else:
+            output_path = input_path.parent / f"{input_path.stem}_temp_{unique_id}.{self.container}"
         
         cmd = ['ffmpeg', '-i', str(input_path)]
         cmd.extend(['-c:v', target_codec])
