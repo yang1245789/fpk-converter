@@ -188,18 +188,22 @@ def api_browse():
     p = request.args.get('path', '/')
     if not p.startswith('/') or '..' in p:
         return jsonify({'error':'Invalid path'}), 400
+    entries = []
     try:
-        entries = []
         if os.path.isdir(p):
             for item in sorted(os.listdir(p)):
                 full = os.path.join(p, item)
                 try:
                     is_dir = os.path.isdir(full)
                     entries.append({'name':item, 'path':full, 'is_dir':is_dir})
+                except PermissionError:
+                    entries.append({'name':item, 'path':full, 'is_dir':True, 'no_access':True})
                 except: pass
-        return jsonify({'path':p, 'entries':entries})
+    except PermissionError:
+        pass
     except Exception as e:
         return jsonify({'error':str(e)}), 500
+    return jsonify({'path':p, 'entries':entries})
 
 HTML = '''<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -226,7 +230,7 @@ function saveCfg(){let d={monitor_dir:el('monitor_dir').value,crf:parseInt(el('c
 async function refresh(){let s=await fetch('/api/status').then(r=>r.json()),b=el('badge');b.textContent=s.running?'运行中':'已停止';b.className='badge '+(s.running?'bg':'br');s.config&&(el('monitor_dir').value=s.config.monitor_dir,el('crf').value=s.config.crf,el('preset').value=s.config.preset,el('threads').value=s.config.threads,el('codec').value=s.config.codec,el('container').value=s.config.container,el('use_gpu').checked=s.config.use_gpu!==false);let l=await fetch('/api/logs').then(r=>r.json());el('ts').textContent=l.total_saved_mb;el('tc2').textContent=l.logs.length;let t=el('tb');t.innerHTML='';l.logs.forEach(r=>{let tr=document.createElement('tr');['filepath','file_size_mb','saved_size_mb'].forEach(k=>{let td=document.createElement('td');td.textContent=r[k];tr.appendChild(td)});let sd=document.createElement('td');sd.textContent=r.success?'成功':'失败';sd.className=r.success?'suc':'err';tr.appendChild(sd);let td=document.createElement('td');td.textContent=r.processed_at;tr.appendChild(td);t.appendChild(tr)})}
 function el(id){return document.getElementById(id)}
 var browsePath='/';
-async function openBrowser(p){if(p)browsePath=p;let d=await fetch('/api/browse?path='+encodeURIComponent(browsePath)).then(r=>r.json());if(d.error){alert(d.error);return}let m=el('modal'),lst=el('blist');el('bpath').textContent=d.path;lst.innerHTML='';if(d.path!=='/'){let b=document.createElement('div');b.className='bitem';b.textContent='.. 返回上级';b.onclick=()=>openBrowser(d.path.split('/').slice(0,-1).join('/')||'/');lst.appendChild(b)}d.entries.forEach(e=>{let b=document.createElement('div');b.className='bitem';b.textContent=e.name+(e.is_dir?'/':'');if(e.is_dir)b.onclick=()=>openBrowser(e.path);else b.style.opacity='0.5';lst.appendChild(b)});m.style.display='flex'}
+async function openBrowser(p){if(p)browsePath=p;let d=await fetch('/api/browse?path='+encodeURIComponent(browsePath)).then(r=>r.json());if(d.error){alert(d.error);return}let m=el('modal'),lst=el('blist');el('bpath').textContent=d.path;lst.innerHTML='';if(d.path!=='/'){let b=document.createElement('div');b.className='bitem';b.textContent='.. 返回上级';b.onclick=()=>openBrowser(d.path.split('/').slice(0,-1).join('/')||'/');lst.appendChild(b)}d.entries.forEach(e=>{let b=document.createElement('div');b.className='bitem';b.textContent=e.name+(e.is_dir?'/':'');if(e.no_access){b.style.opacity='0.4';b.title='无权限'}else if(e.is_dir){b.onclick=()=>openBrowser(e.path)}else{b.style.opacity='0.5'}lst.appendChild(b)});m.style.display='flex'}
 function selectDir(){el('monitor_dir').value=browsePath;el('modal').style.display='none'}
 function el(id){return document.getElementById(id)}
 refresh();setInterval(refresh,5000)</script>
