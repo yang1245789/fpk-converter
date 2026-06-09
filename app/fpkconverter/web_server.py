@@ -1,18 +1,41 @@
 #!/usr/bin/env python3
-"""
-飞牛视频转码 Web 服务
-路径策略: 基于脚本自身位置 (os.path.abspath), 不依赖环境变量
-"""
-import os, sys
+import os, sys, traceback
 
-# === 路径自检测 (不依赖 TRIM_PKG/TRIM_PKGVAR) ===
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))   # .../app/fpkconverter
-PKG_DIR    = os.path.join(SCRIPT_DIR, 'packages')          # .../app/fpkconverter/packages
-# VAR_DIR: 优先 TRIM_PKGVAR(数据卷)，其次安装目录下的 data/，绝不碰 /var/lib
+# === 启动信号 (在任何 import 之前，验证脚本确实被启动了) ===
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+BOOT_LOG = os.path.join(SCRIPT_DIR, 'boot.log')
+try:
+    with open(BOOT_LOG, 'w') as f:
+        f.write(f'BOOTED: {os.path.abspath(__file__)}\n')
+        f.write(f'SCRIPT_DIR: {SCRIPT_DIR}\n')
+        f.write(f'PID: {os.getpid()}\n')
+        f.write(f'Python: {sys.version}\n')
+        f.write(f'CWD: {os.getcwd()}\n')
+        f.write(f'TRIM_PKG: {os.environ.get("TRIM_PKG","unset")}\n')
+        f.write(f'TRIM_PKGVAR: {os.environ.get("TRIM_PKGVAR","unset")}\n')
+except:
+    pass
+
+# === 崩溃兜底：任何未捕获异常写入 app 目录下的 crash.log ===
+CRASH_LOG = os.path.join(SCRIPT_DIR, 'crash.log')
+def _global_excepthook(etype, value, tb):
+    try:
+        with open(CRASH_LOG, 'w') as f:
+            f.write(f'CRASH at {__file__}\n')
+            f.write(f'Python: {sys.version}\n')
+            f.write(f'CWD: {os.getcwd()}\n')
+            f.write(f'sys.path: {sys.path[:10]}\n')
+            traceback.print_exception(etype, value, tb, file=f)
+    except:
+        pass
+    sys.__excepthook__(etype, value, tb)
+sys.excepthook = _global_excepthook
+
+# === 路径自检测 ===
+PKG_DIR    = os.path.join(SCRIPT_DIR, 'packages')
 VAR_DIR    = os.environ.get('TRIM_PKGVAR') or os.path.join(SCRIPT_DIR, 'data')
 os.makedirs(VAR_DIR, exist_ok=True)
 
-# 将 packages 加入 Python 搜索路径
 if os.path.isdir(PKG_DIR) and PKG_DIR not in sys.path:
     sys.path.insert(0, PKG_DIR)
 
@@ -21,18 +44,8 @@ CONFIG_PATH = os.path.join(VAR_DIR, 'config.json')
 
 import subprocess, sqlite3, time, json, threading
 
-# === Flask 导入 (带崩溃诊断) ===
-CRASH_LOG = os.path.join(VAR_DIR, 'crash.log')
-try:
-    from flask import Flask, render_template_string, request, jsonify
-except Exception as _e:
-    with open(CRASH_LOG, 'a') as f:
-        f.write(f'FLASK_IMPORT_ERROR: {_e}\n')
-        f.write(f'SYS_PATH: {sys.path}\n')
-        f.write(f'PKG_DIR: {PKG_DIR} exists={os.path.isdir(PKG_DIR)}\n')
-        if os.path.isdir(PKG_DIR):
-            f.write(f'PKG_CONTENTS: {os.listdir(PKG_DIR)[:20]}\n')
-    raise
+# === Flask 导入 ===
+from flask import Flask, render_template_string, request, jsonify
 
 app = Flask(__name__)
 

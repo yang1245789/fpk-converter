@@ -1,94 +1,53 @@
 #!/bin/sh
 
-LOG_FILE="${TRIM_PKGVAR}/info.log"
-PID_FILE="${TRIM_PKGVAR}/app.pid"
+# === 路径定位（修复: fnpack去掉了app/前缀） ===
+# TRIM_PKG=/var/apps/fpkconverter (root) 或 /vol1/@appcenter/fpkconverter (data)
+# 实际结构: ${TRIM_PKG}/fpkconverter/web_server.py
 
-mkdir -p "${TRIM_PKGVAR}" 2>/dev/null || true
+if [ -n "${TRIM_PKG}" ]; then
+    APP_DIR="${TRIM_PKG}/fpkconverter"
+else
+    APP_DIR="$(cd "$(dirname "$0")" && pwd)/../fpkconverter"
+fi
 
-APP_DIR="${TRIM_PKG}/app/fpkconverter"
-PKG="${APP_DIR}/packages"
-WEB="${APP_DIR}/web_server.py"
+# 兜底: /var/apps/fpkconverter/fpkconverter
+[ ! -f "$APP_DIR/web_server.py" ] && APP_DIR="/var/apps/fpkconverter/fpkconverter"
+# 再兜底: /vol1/@appcenter/fpkconverter/fpkconverter
+[ ! -f "$APP_DIR/web_server.py" ] && APP_DIR="/vol1/@appcenter/fpkconverter/fpkconverter"
 
-log_msg() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> ${LOG_FILE} 2>/dev/null || true
-}
+# 数据目录
+[ -n "${TRIM_PKGVAR}" ] && VAR_DIR="${TRIM_PKGVAR}" || VAR_DIR="$APP_DIR/data"
+mkdir -p "$VAR_DIR" 2>/dev/null || true
 
-CMD="cd ${APP_DIR} && PYTHONPATH=${PKG}:\${PYTHONPATH} python3 ${WEB}"
+PID_FILE="$VAR_DIR/app.pid"
+LOG_FILE="$VAR_DIR/app.log"
 
-start_process() {
-    if status_impl; then
-        return 0
-    fi
+# 调试日志
+echo "$(date) $1 APP=$APP_DIR VAR=$VAR_DIR PKG=${TRIM_PKG:-none} PKGVAR=${TRIM_PKGVAR:-none}" >> "$APP_DIR/boot.log" 2>/dev/null || true
 
-    log_msg "Starting ..."
-    bash -c "${CMD}" >> ${LOG_FILE} 2>&1 &
-    _pid=$!
-    printf "%s" "${_pid}" > ${PID_FILE}
-    log_msg "PID=${_pid}"
-    return 0
-}
-
-stop_process() {
-    log_msg "Stopping ..."
-
-    if [ -r "${PID_FILE}" ]; then
-        _pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
-
-        if ! check_process "${_pid}"; then
-            rm -f "${PID_FILE}"
-            return 0
-        fi
-
-        log_msg "send TERM to PID:${_pid}"
-        kill -TERM ${_pid} >> ${LOG_FILE} 2>&1
-
-        _count=0
-        while check_process "${_pid}" && [ ${_count} -lt 10 ]; do
-            sleep 1
-            _count=$((_count + 1))
-        done
-
-        if check_process "${_pid}"; then
-            log_msg "send KILL to PID:${_pid}"
-            kill -KILL "${_pid}"
-            sleep 1
-        fi
-        rm -f "${PID_FILE}"
-    fi
-
-    return 0
-}
-
-check_process() {
-    _pid=$1
-    kill -0 "${_pid}" 2>/dev/null && return 0 || return 1
-}
-
-status_impl() {
-    if [ -f "${PID_FILE}" ]; then
-        _pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
-        if check_process "${_pid}"; then
-            return 0
-        else
-            rm -f "${PID_FILE}"
-        fi
-    fi
-    return 1
+check() {
+    [ -f "$PID_FILE" ] || return 1
+    _p=$(head -n1 "$PID_FILE" 2>/dev/null | tr -d '[:space:]')
+    [ -n "$_p" ] && kill -0 "$_p" 2>/dev/null
 }
 
 case $1 in
 start)
-    start_process
+    check && exit 0
+    [ -f "$APP_DIR/web_server.py" ] || { echo "FAIL web_server.py not found at $APP_DIR" >> "$APP_DIR/boot.log" 2>/dev/null; exit 1; }
+    cd "$APP_DIR" || exit 1
+    export PYTHONPATH="$APP_DIR/packages:$PYTHONPATH"
+    python3 web_server.py >> "$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+    echo "OK PID=$!" >> "$APP_DIR/boot.log" 2>/dev/null || true
+    exit 0
     ;;
 stop)
-    stop_process
+    [ -f "$PID_FILE" ] && { _p=$(head -n1 "$PID_FILE" | tr -d '[:space:]'); kill -TERM "$_p" 2>/dev/null; sleep 1; kill -KILL "$_p" 2>/dev/null; rm -f "$PID_FILE"; }
+    exit 0
     ;;
 status)
-    if status_impl; then
-        exit 0
-    else
-        exit 3
-    fi
+    check && exit 0 || exit 3
     ;;
 *)
     exit 1
