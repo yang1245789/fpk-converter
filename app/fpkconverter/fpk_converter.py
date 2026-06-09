@@ -139,14 +139,16 @@ class VideoConverter:
 
     def _validate_path(self, filepath):
         try:
-            filepath = Path(filepath).resolve()
+            filepath = Path(filepath)
+            # 在 resolve 之前检查路径遍历
+            if '..' in str(filepath):
+                return None
+            filepath = filepath.resolve()
         except (OSError, ValueError, RuntimeError):
             return None
         if not filepath.is_file():
             return None
         if filepath.name.startswith('.'):
-            return None
-        if '..' in str(filepath):
             return None
         return filepath
 
@@ -180,8 +182,10 @@ class VideoConverter:
             '-show_format', '-show_streams',
             str(filepath)
         ]
+        log_file = None
         try:
-            log_file = self.temp_dir / f"ffprobe_{os.getpid()}_{int(time.time())}.log" if self.temp_dir else None
+            if self.temp_dir and self.temp_dir.is_dir():
+                log_file = self.temp_dir / f"ffprobe_{os.getpid()}_{int(time.time())}.log"
             if log_file:
                 with open(log_file, 'w') as lf:
                     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=lf, timeout=60)
@@ -189,11 +193,19 @@ class VideoConverter:
                 result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60)
             
             if result.returncode != 0:
+                # 失败时也要清理 ffprobe 日志
+                if log_file and log_file.exists():
+                    try: log_file.unlink()
+                    except Exception: pass
                 return None
             try:
                 stdout_str = result.stdout.decode('utf-8', errors='replace')
                 info = json.loads(stdout_str)
             except (json.JSONDecodeError, UnicodeDecodeError):
+                # 解析失败时也要清理 ffprobe 日志
+                if log_file and log_file.exists():
+                    try: log_file.unlink()
+                    except Exception: pass
                 return None
             
             video_stream = None
@@ -203,6 +215,10 @@ class VideoConverter:
                     break
             
             if not video_stream:
+                # 没有视频流时也要清理 ffprobe 日志
+                if log_file and log_file.exists():
+                    try: log_file.unlink()
+                    except Exception: pass
                 return None
             
             width = video_stream.get('width', 0)
@@ -218,15 +234,28 @@ class VideoConverter:
             except (ValueError, TypeError):
                 bit_rate = 0
             
+            # 成功获取信息后清理 ffprobe 日志
+            if log_file and log_file.exists():
+                try: log_file.unlink()
+                except Exception: pass
             return {'width': width, 'height': height, 'codec': codec, 'bit_rate': bit_rate}
         except subprocess.TimeoutExpired:
             print(f"ffprobe 超时: {filepath}")
+            if log_file and log_file.exists():
+                try: log_file.unlink()
+                except Exception: pass
             return None
         except FileNotFoundError:
             print("ffprobe 未安装")
+            if log_file and log_file.exists():
+                try: log_file.unlink()
+                except Exception: pass
             return None
         except Exception as e:
             print(f"获取视频信息失败: {e}")
+            if log_file and log_file.exists():
+                try: log_file.unlink()
+                except Exception: pass
             return None
 
     def should_skip_transcode(self, video_info):
@@ -296,9 +325,14 @@ class VideoConverter:
             try:
                 mtime = os.path.getmtime(filepath_str)
                 if mtime > queued_at:
-                    print(f"文件在等待期间被修改，重新入队: {filepath_str}")
+                    # 限制重新入队次数，防止文件持续被修改导致无限循环
+                    retry_count = item.get('retry', 0)
+                    if retry_count >= 3:
+                        print(f"文件修改次数过多，跳过: {filepath_str}")
+                        continue
+                    print(f"文件在等待期间被修改，重新入队({retry_count+1}/3): {filepath_str}")
                     with self._queue_lock:
-                        self._queue.append({'path': filepath_str, 'queued_at': time.time()})
+                        self._queue.append({'path': filepath_str, 'queued_at': time.time(), 'retry': retry_count + 1})
                     continue
             except Exception:
                 pass
@@ -327,9 +361,16 @@ class VideoConverter:
                     files.append((f, sz))
             files.sort(key=lambda x: x[0].stat().st_mtime)
             limit = self.TEMP_MAX_GB * 1024 * 1024 * 1024
+            now = time.time()
             for f, sz in files:
                 if total <= limit:
                     break
+                # 跳过最近5分钟内创建的文件，可能正在使用
+                try:
+                    if now - f.stat().st_mtime < 300:
+                        continue
+                except Exception:
+                    continue
                 try:
                     f.unlink()
                     total -= sz
@@ -379,12 +420,18 @@ class VideoConverter:
             self.db.add_processed_file(input_path, original_size, True, 0)
             return True, 0
         
-        target_codec = 'hevc_qsv' if self.use_gpu else 'libx265'
+        # 尊重用户选择的编码器，GPU加速仅在用户选择HEVC时生效
+        if self.use_gpu and self.codec in ('libx265', 'hevc_qsv'):
+            target_codec = 'hevc_qsv'
+        elif self.use_gpu and self.codec == 'libx264':
+            target_codec = 'h264_qsv'
+        else:
+            target_codec = self.codec
         
         target_width, target_height = width, height
         needs_resize = False
         
-        if height >= 1080 and height > 1080:
+        if height > 1080:
             target_height = 1080
             target_width = int(width * 1080 / height)
             target_width = target_width - (target_width % 2)
@@ -399,7 +446,9 @@ class VideoConverter:
         if self.temp_dir and self.temp_dir.is_dir():
             output_path = self.temp_dir / f"{input_path.stem}_temp_{unique_id}.{self.container}"
         else:
-            output_path = input_path.parent / f"{input_path.stem}_temp_{unique_id}.{self.container}"
+            # 如果 temp_dir 不可用，使用系统临时目录，避免污染原文件目录
+            import tempfile
+            output_path = Path(tempfile.gettempdir()) / f"fpkc_{input_path.stem}_temp_{unique_id}.{self.container}"
         
         cmd = ['ffmpeg', '-i', str(input_path)]
         cmd.extend(['-c:v', target_codec])
@@ -418,8 +467,8 @@ class VideoConverter:
         cmd.extend(['-c:a', 'copy'])
         cmd.extend(['-y', str(output_path)])
 
+        ffmpeg_log = self.temp_dir / f"ffmpeg_{unique_id}.log" if (self.temp_dir and self.temp_dir.is_dir()) else None
         try:
-            ffmpeg_log = self.temp_dir / f"ffmpeg_{unique_id}.log" if self.temp_dir else None
             if ffmpeg_log:
                 with open(ffmpeg_log, 'w') as log_file:
                     result = subprocess.run(cmd, stdout=log_file, stderr=subprocess.STDOUT, timeout=3600)
@@ -431,6 +480,8 @@ class VideoConverter:
                 if ffmpeg_log and ffmpeg_log.exists():
                     try: err_msg = ffmpeg_log.read_text()[-500:]
                     except: pass
+                    try: ffmpeg_log.unlink()
+                    except: pass
                 print(f"FFmpeg 错误: {err_msg}")
                 self.db.add_processed_file(input_path, original_size, False)
                 if output_path.exists():
@@ -439,6 +490,9 @@ class VideoConverter:
                 return False, 0
         except subprocess.TimeoutExpired:
             print(f"FFmpeg 转码超时: {input_path}")
+            if ffmpeg_log and ffmpeg_log.exists():
+                try: ffmpeg_log.unlink()
+                except: pass
             if output_path.exists():
                 try: output_path.unlink()
                 except: pass
@@ -446,10 +500,16 @@ class VideoConverter:
             return False, 0
         except FileNotFoundError:
             print("ffmpeg 未安装")
+            if ffmpeg_log and ffmpeg_log.exists():
+                try: ffmpeg_log.unlink()
+                except: pass
             self.db.add_processed_file(input_path, original_size, False)
             return False, 0
         except Exception as e:
             print(f"转码失败: {e}")
+            if ffmpeg_log and ffmpeg_log.exists():
+                try: ffmpeg_log.unlink()
+                except: pass
             self.db.add_processed_file(input_path, original_size, False)
             return False, 0
 
@@ -461,13 +521,34 @@ class VideoConverter:
             self.db.add_processed_file(input_path, original_size, False)
             return False, 0
 
+        # 转码成功后清理 ffmpeg 日志
+        if ffmpeg_log and ffmpeg_log.exists():
+            try: ffmpeg_log.unlink()
+            except: pass
+
         print(f"转码完成: 原大小 {original_size / (1024*1024):.2f} MB, 新大小 {converted_size / (1024*1024):.2f} MB")
 
         saved_size = original_size - converted_size
         if converted_size < original_size:
             print(f"转码后更小，节省 {saved_size / (1024*1024):.2f} MB")
             final_output_path = input_path.parent / f"{input_path.stem}.{self.container}"
-            if final_output_path.exists():
+            backup_path = None
+            original_stem = input_path.stem
+            original_suffix = input_path.suffix
+            # 如果输出路径和原文件相同，先移动原文件到备份，避免数据丢失
+            if final_output_path.resolve() == input_path.resolve():
+                backup_path = input_path.parent / f"{original_stem}_backup_{unique_id}{original_suffix}"
+                try:
+                    shutil.move(str(input_path), str(backup_path))
+                    input_path = backup_path  # 后续删除的是备份
+                except Exception as e:
+                    print(f"备份原文件失败: {e}")
+                    if output_path.exists():
+                        try: output_path.unlink()
+                        except: pass
+                    return False, 0
+            elif final_output_path.exists():
+                # 不同路径但目标已存在，先删除目标
                 try: final_output_path.unlink()
                 except: pass
             try:
@@ -475,13 +556,25 @@ class VideoConverter:
                 shutil.move(str(output_path), str(final_output_path))
             except Exception as e:
                 print(f"移动输出文件失败: {e}")
+                # 尝试恢复备份
+                if backup_path and backup_path.exists():
+                    try:
+                        restore_target = final_output_path.parent / f"{original_stem}{original_suffix}"
+                        shutil.move(str(backup_path), str(restore_target))
+                        print("已恢复备份")
+                    except Exception:
+                        pass
                 if output_path.exists():
                     try: output_path.unlink()
                     except: pass
                 return False, 0
             try:
-                input_path.unlink()
-                print(f"已替换原文件: {input_path}")
+                # 删除原文件（或备份）
+                if backup_path and backup_path.exists():
+                    backup_path.unlink()
+                else:
+                    input_path.unlink()
+                print(f"已替换原文件: {final_output_path}")
             except Exception as e:
                 print(f"删除原文件失败(转码文件已保留): {e}")
             self.db.add_processed_file(str(final_output_path), original_size, True, saved_size)

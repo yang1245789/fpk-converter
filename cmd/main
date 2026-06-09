@@ -90,9 +90,19 @@ start)
 stop)
     if [ -f "$PID" ]; then
         p=$(head -n1 "$PID" | tr -d '[:space:]')
-        kill -TERM "$p" 2>/dev/null
-        sleep 1
-        kill -KILL "$p" 2>/dev/null
+        if [ -n "$p" ]; then
+            kill -TERM "$p" 2>/dev/null
+            # 等待进程退出，最多3秒
+            for i in 1 2 3; do
+                sleep 1
+                kill -0 "$p" 2>/dev/null || break
+            done
+            # 如果还在，强制杀死
+            if kill -0 "$p" 2>/dev/null; then
+                kill -KILL "$p" 2>/dev/null
+                sleep 1
+            fi
+        fi
         rm -f "$PID"
     fi
     exit 0

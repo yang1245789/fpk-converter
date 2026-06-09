@@ -104,7 +104,8 @@ def api_cfg():
             if k not in ALLOWED: continue
             if k == 'monitor_dir':
                 vs = str(v)
-                if vs.startswith('/') and '..' not in vs: cfg[k] = vs
+                if vs.startswith('/') and '..' not in vs and os.path.normpath(vs) == vs:
+                    cfg[k] = vs
             elif k == 'crf':
                 try: cfg[k] = max(1, min(51, int(v)))
                 except: pass
@@ -124,45 +125,50 @@ def api_status():
     global last_error
     return jsonify({'running':_is_running(), 'config':cfg, 'error':last_error})
 
-TEMP_DIR = os.path.join(SCRIPT_DIR, 'temp')
+TEMP_DIR = os.path.join(VAR_DIR, 'temp')
 
 @app.route('/api/start', methods=['POST'])
 def api_start():
     global proc, last_error, conv_log_file
+    # 先在锁外做验证和文件准备
+    last_error = ''
+    if _is_running():
+        return jsonify({'success':False, 'error':'已在运行中'})
+    md = cfg.get('monitor_dir','')
+    if not md or not md.startswith('/') or '..' in md or os.path.normpath(md) != md:
+        last_error = '请先选择监控文件夹'
+        return jsonify({'success':False, 'error':last_error})
+    if not os.path.isdir(md):
+        last_error = f'目录不存在: {md}'
+        return jsonify({'success':False, 'error':last_error})
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    jp = os.path.join(VAR_DIR, 'start_config.json')
+    with open(jp,'w') as f: json.dump({
+        'db_path':DB_PATH, 'code_dir':SCRIPT_DIR, 'monitor_dir':md,
+        'crf':cfg.get('crf',23), 'codec':cfg.get('codec','libx264'),
+        'container':cfg.get('container','mp4'), 'preset':cfg.get('preset','medium'),
+        'threads':cfg.get('threads',1), 'use_gpu':cfg.get('use_gpu',True),
+        'temp_dir': TEMP_DIR, 'max_depth': 3}, f)
+    sc = os.path.join(VAR_DIR, 'start_converter.py')
+    with open(sc,'w') as f: f.write(
+        'import sys,os,json\n'
+        'sd=os.path.dirname(os.path.abspath(__file__))\n'
+        'jv=os.environ.get("TRIM_PKGVAR") or os.path.join(sd,"..","app","fpkconverter","data")\n'
+        'with open(os.path.join(jv,"start_config.json")) as fh:c=json.load(fh)\n'
+        'sys.path.insert(0,c["code_dir"])\n'
+        'pk=os.path.join(c["code_dir"],"packages")\n'
+        'if os.path.isdir(pk):\n'
+        '    sys.path.insert(0,pk)\n'
+        'from fpk_converter import Database,VideoConverter,FolderScanner\n'
+        'db=Database(c["db_path"])\n'
+        'td=c.get("temp_dir","")\n'
+        'vc=VideoConverter(db,c["crf"],c["codec"],c["container"],c["preset"],c["threads"],c["use_gpu"],temp_dir=td if td else None)\n'
+        'FolderScanner(c["monitor_dir"],vc,max_depth=c.get("max_depth",3)).start()')
+    os.chmod(sc, 0o755)
+    # 只在启动进程和更新状态时持锁，缩小锁范围
     with proc_lock:
-        last_error = ''
         if _is_running():
             return jsonify({'success':False, 'error':'已在运行中'})
-        md = cfg.get('monitor_dir','')
-        if not md or not md.startswith('/') or '..' in md:
-            last_error = '请先选择监控文件夹'
-            return jsonify({'success':False, 'error':last_error})
-        if not os.path.isdir(md):
-            last_error = f'目录不存在: {md}'
-            return jsonify({'success':False, 'error':last_error})
-        os.makedirs(TEMP_DIR, exist_ok=True)
-        jp = os.path.join(VAR_DIR, 'start_config.json')
-        with open(jp,'w') as f: json.dump({
-            'db_path':DB_PATH, 'code_dir':SCRIPT_DIR, 'monitor_dir':md,
-            'crf':cfg.get('crf',23), 'codec':cfg.get('codec','libx264'),
-            'container':cfg.get('container','mp4'), 'preset':cfg.get('preset','medium'),
-            'threads':cfg.get('threads',1), 'use_gpu':cfg.get('use_gpu',True),
-            'temp_dir': TEMP_DIR}, f)
-        sc = os.path.join(VAR_DIR, 'start_converter.py')
-        with open(sc,'w') as f: f.write(
-            'import sys,os,json\n'
-            'sd=os.path.dirname(os.path.abspath(__file__))\n'
-            'jv=os.environ.get("TRIM_PKGVAR") or os.path.join(sd,"..","app","fpkconverter","data")\n'
-            'with open(os.path.join(jv,"start_config.json")) as fh:c=json.load(fh)\n'
-            'sys.path.insert(0,c["code_dir"])\n'
-            'pk=os.path.join(c["code_dir"],"packages")\n'
-            'if os.path.isdir(pk):\n'
-            '    sys.path.insert(0,pk)\n'
-            'from fpk_converter import Database,VideoConverter,FolderScanner\n'
-            'db=Database(c["db_path"])\n'
-            'vc=VideoConverter(db,c["crf"],c["codec"],c["container"],c["preset"],c["threads"],c["use_gpu"],temp_dir=c.get("temp_dir",""))\n'
-            'FolderScanner(c["monitor_dir"],vc).start()')
-        os.chmod(sc, 0o755)
         if conv_log_file:
             try: conv_log_file.close()
             except: pass
@@ -170,20 +176,21 @@ def api_start():
         conv_log_file = open(CONV_LOG, 'a')
         proc = subprocess.Popen([sys.executable, sc], cwd=VAR_DIR, start_new_session=True,
                                 stdout=conv_log_file, stderr=subprocess.STDOUT)
-        # 非阻塞健康检查：2秒后验证
-        def _health_check():
-            global proc, last_error, conv_log_file
-            time.sleep(2)
-            if not _is_running():
+    # 非阻塞健康检查：3秒后验证
+    def _health_check():
+        global proc, last_error, conv_log_file
+        time.sleep(3)
+        with proc_lock:
+            if proc and not _is_running():
                 last_error = '转码进程启动后立刻退出，请检查日志'
                 if conv_log_file:
                     try: conv_log_file.close()
                     except: pass
                     conv_log_file = None
                 proc = None
-        threading.Thread(target=_health_check, daemon=True).start()
-        cfg['enabled'] = True; save_cfg()
-        return jsonify({'success':True})
+    threading.Thread(target=_health_check, daemon=True).start()
+    cfg['enabled'] = True; save_cfg()
+    return jsonify({'success':True})
 
 @app.route('/api/stop', methods=['POST'])
 def api_stop():
@@ -191,10 +198,22 @@ def api_stop():
     with proc_lock:
         last_error = ''
         if proc:
-            try: proc.terminate(); proc.wait(timeout=10)
-            except:
-                try: proc.kill(); proc.wait(timeout=5)
-                except: pass
+            try:
+                proc.terminate()
+                proc.wait(timeout=10)
+            except Exception:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+            try:
+                # 确保进程已终止
+                if proc.poll() is None:
+                    import signal
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                pass
             proc = None
         if conv_log_file:
             try: conv_log_file.close()
@@ -227,8 +246,11 @@ SAFE_ROOTS = ['/vol1','/vol2','/vol3','/vol4','/vol5','/vol6','/vol7','/vol8']
 @app.route('/api/browse')
 def api_browse():
     p = request.args.get('path', '/')
-    if not p.startswith('/') or '..' in p:
+    if not p.startswith('/') or '..' in p or os.path.normpath(p) != p:
         return jsonify({'error':'Invalid path'}), 400
+    # 限制路径深度，防止过深遍历
+    if p.count('/') > 10:
+        return jsonify({'error':'Path too deep'}), 400
     if p == '/':
         entries = []
         for vol in SAFE_ROOTS:
@@ -241,6 +263,8 @@ def api_browse():
     try:
         if os.path.isdir(p):
             for item in sorted(os.listdir(p)):
+                if len(entries) >= 500:  # 限制最多返回500条
+                    break
                 full = os.path.join(p, item)
                 try:
                     is_dir = os.path.isdir(full)
@@ -277,12 +301,12 @@ HTML = '''<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <div class="s"><div class="st">统计</div><div class="stats"><div class="sc"><div class="sv" id="ts">0</div><div class="sl">节省(MB)</div></div><div class="sc"><div class="sv" id="tc2">0</div><div class="sl">处理文件</div></div></div></div>
 <div class="s"><div class="st">转码日志</div><div class="tc"><table><thead><tr><th>文件</th><th>原大小</th><th>节省</th><th>状态</th><th>时间</th></tr></thead><tbody id="tb"></tbody></table></div></div></div></div>
 <script>
-function api(a){fetch('/api/'+a,{method:'POST'}).then(r=>r.json()).then(d=>{if(d.error){el('errmsg').textContent=d.error;el('errmsg').style.display='block'}else{el('errmsg').style.display='none'}refresh()})}
-function saveCfg(){let d={monitor_dir:el('monitor_dir').value,crf:parseInt(el('crf').value),preset:el('preset').value,threads:parseInt(el('threads').value),codec:el('codec').value,container:el('container').value,use_gpu:el('use_gpu').checked};fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(d=>{if(d.success)alert('已保存');else alert('保存失败')})}
-async function refresh(){let s=await fetch('/api/status').then(r=>r.json()),b=el('badge');b.textContent=s.running?'运行中':'已停止';b.className='badge '+(s.running?'bg':'br');s.config&&(el('monitor_dir').value=s.config.monitor_dir,el('crf').value=s.config.crf,el('preset').value=s.config.preset,el('threads').value=s.config.threads,el('codec').value=s.config.codec,el('container').value=s.config.container,el('use_gpu').checked=s.config.use_gpu!==false);let l=await fetch('/api/logs').then(r=>r.json());el('ts').textContent=l.total_saved_mb;el('tc2').textContent=l.logs.length;let t=el('tb');t.innerHTML='';l.logs.forEach(r=>{let tr=document.createElement('tr');['filepath','file_size_mb','saved_size_mb'].forEach(k=>{let td=document.createElement('td');td.textContent=r[k];tr.appendChild(td)});let sd=document.createElement('td');sd.textContent=r.success?'成功':'失败';sd.className=r.success?'suc':'err';tr.appendChild(sd);let td=document.createElement('td');td.textContent=r.processed_at;tr.appendChild(td);t.appendChild(tr)})}
+function api(a){fetch('/api/'+a,{method:'POST'}).then(r=>{if(!r.ok)throw new Error(r.status);return r.json()}).then(d=>{if(d.error){el('errmsg').textContent=d.error;el('errmsg').style.display='block'}else{el('errmsg').style.display='none'}refresh()}).catch(e=>{el('errmsg').textContent='请求失败: '+e.message;el('errmsg').style.display='block'})}
+function saveCfg(){let d={monitor_dir:el('monitor_dir').value,crf:parseInt(el('crf').value),preset:el('preset').value,threads:parseInt(el('threads').value),codec:el('codec').value,container:el('container').value,use_gpu:el('use_gpu').checked};fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>{if(!r.ok)throw new Error(r.status);return r.json()}).then(d=>{if(d.success)alert('已保存');else alert('保存失败')}).catch(e=>alert('保存失败: '+e.message))}
+async function refresh(){try{let s=await fetch('/api/status').then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});let b=el('badge');b.textContent=s.running?'运行中':'已停止';b.className='badge '+(s.running?'bg':'br');s.config&&(el('monitor_dir').value=s.config.monitor_dir,el('crf').value=s.config.crf,el('preset').value=s.config.preset,el('threads').value=s.config.threads,el('codec').value=s.config.codec,el('container').value=s.config.container,el('use_gpu').checked=s.config.use_gpu!==false);let l=await fetch('/api/logs').then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});el('ts').textContent=l.total_saved_mb;el('tc2').textContent=l.logs.length;let t=el('tb');t.innerHTML='';l.logs.forEach(r=>{let tr=document.createElement('tr');['filepath','file_size_mb','saved_size_mb'].forEach(k=>{let td=document.createElement('td');td.textContent=r[k];tr.appendChild(td)});let sd=document.createElement('td');sd.textContent=r.success?'成功':'失败';sd.className=r.success?'suc':'err';tr.appendChild(sd);let td=document.createElement('td');td.textContent=r.processed_at;tr.appendChild(td);t.appendChild(tr)})}catch(e){console.error('refresh error:',e)}}
 function el(id){return document.getElementById(id)}
 var browsePath='/';
-async function openBrowser(p){if(p)browsePath=p;let d=await fetch('/api/browse?path='+encodeURIComponent(browsePath)).then(r=>r.json());if(d.error){alert(d.error);return}let m=el('modal'),lst=el('blist');el('bpath').textContent=d.path;lst.innerHTML='';if(d.path!=='/'){let b=document.createElement('div');b.className='bitem';b.textContent='.. 返回上级';b.onclick=()=>openBrowser(d.path.split('/').slice(0,-1).join('/')||'/');lst.appendChild(b)}d.entries.forEach(e=>{let b=document.createElement('div');b.className='bitem';b.textContent=e.name+(e.is_dir?'/':'');if(e.no_access){b.style.opacity='0.4';b.title='无权限'}else if(e.is_dir){b.onclick=()=>openBrowser(e.path)}else{b.style.opacity='0.5'}lst.appendChild(b)});m.style.display='flex'}
+async function openBrowser(p){if(p)browsePath=p;try{let d=await fetch('/api/browse?path='+encodeURIComponent(browsePath)).then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});if(d.error){alert(d.error);return}let m=el('modal'),lst=el('blist');el('bpath').textContent=d.path;lst.innerHTML='';if(d.path!=='/'){let b=document.createElement('div');b.className='bitem';b.textContent='.. 返回上级';b.onclick=()=>openBrowser(d.path.split('/').slice(0,-1).join('/')||'/');lst.appendChild(b)}d.entries.forEach(e=>{let b=document.createElement('div');b.className='bitem';b.textContent=e.name+(e.is_dir?'/':'');if(e.no_access){b.style.opacity='0.4';b.title='无权限'}else if(e.is_dir){b.onclick=()=>openBrowser(e.path)}else{b.style.opacity='0.5'}lst.appendChild(b)});m.style.display='flex'}catch(e){alert('浏览目录失败: '+e.message)}}
 function selectDir(){el('monitor_dir').value=browsePath;el('modal').style.display='none';saveCfg()}
 refresh();setInterval(refresh,5000)</script>
 <div id="modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:999;align-items:center;justify-content:center"><div style="background:#fff;border-radius:12px;width:90%;max-width:500px;max-height:70vh;display:flex;flex-direction:column"><div style="padding:16px 20px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;align-items:center"><span id="bpath" style="font-weight:600;font-size:14px">/</span><div><button class="btn bt2" style="padding:6px 14px;font-size:13px" onclick="selectDir()">选择此目录</button><button class="btn bt3" style="padding:6px 14px;font-size:13px;margin-left:6px" onclick="el('modal').style.display='none'">关闭</button></div></div><div id="blist" style="overflow-y:auto;flex:1;padding:8px 12px"></div></div></div>
@@ -293,11 +317,20 @@ if __name__ == '__main__':
     def _sigterm(sig, frame):
         global proc, conv_log_file
         if proc:
-            try: proc.terminate(); proc.wait(timeout=5)
-            except: pass
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=3)
+                except Exception:
+                    pass
+            proc = None
         if conv_log_file:
             try: conv_log_file.close()
             except: pass
+            conv_log_file = None
         sys.exit(0)
     signal.signal(signal.SIGTERM, _sigterm)
     print(f'Starting on http://0.0.0.0:5000 (packages:{PKG_DIR})', flush=True)
