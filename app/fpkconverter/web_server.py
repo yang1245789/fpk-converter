@@ -241,8 +241,6 @@ def api_logs():
         total += r[5] or 0
     return jsonify({'logs':logs,'total_saved_mb':round(total/1048576,2)})
 
-SAFE_ROOTS = ['/vol1','/vol2','/vol3','/vol4','/vol5','/vol6','/vol7','/vol8']
-
 @app.route('/api/browse')
 def api_browse():
     p = request.args.get('path', '/')
@@ -251,27 +249,24 @@ def api_browse():
     # 限制路径深度，防止过深遍历
     if p.count('/') > 10:
         return jsonify({'error':'Path too deep'}), 400
-    if p == '/':
-        entries = []
-        for vol in SAFE_ROOTS:
-            try:
-                if os.path.isdir(vol):
-                    entries.append({'name':os.path.basename(vol), 'path':vol, 'is_dir':True})
-                else:
-                    # 卷存在但不是目录，也显示出来
-                    try:
-                        os.lstat(vol)
-                        entries.append({'name':os.path.basename(vol), 'path':vol, 'is_dir':True, 'no_access':True})
-                    except Exception:
-                        pass
-            except PermissionError:
-                # 权限不足，仍然显示该卷，标记为无权限
-                entries.append({'name':os.path.basename(vol), 'path':vol, 'is_dir':True, 'no_access':True})
-            except: pass
-        return jsonify({'path':'/', 'entries':entries})
     entries = []
     try:
-        if os.path.isdir(p):
+        if p == '/':
+            # 动态扫描根目录，只显示当前进程可访问的目录
+            try:
+                for item in sorted(os.listdir('/')):
+                    if len(entries) >= 50:
+                        break
+                    full = os.path.join('/', item)
+                    try:
+                        if os.path.isdir(full):
+                            entries.append({'name':item, 'path':full, 'is_dir':True})
+                    except PermissionError:
+                        entries.append({'name':item, 'path':full, 'is_dir':True, 'no_access':True})
+                    except: pass
+            except PermissionError:
+                return jsonify({'error':'无权限访问根目录'}), 403
+        elif os.path.isdir(p):
             for item in sorted(os.listdir(p)):
                 if len(entries) >= 500:  # 限制最多返回500条
                     break

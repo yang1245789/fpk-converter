@@ -125,7 +125,7 @@ class VideoConverter:
         self.preset = preset if preset in self.ALLOWED_PRESETS else 'medium'
         self.threads = max(1, min(16, int(threads)))
         self.use_gpu = bool(use_gpu)
-        self.temp_dir = Path(temp_dir) if temp_dir else None
+        self.temp_dir = Path(temp_dir) if temp_dir and str(temp_dir).strip() else None
         if self.temp_dir and not self.temp_dir.exists():
             self.temp_dir.mkdir(parents=True, exist_ok=True)
         self._queue = []
