@@ -1,6 +1,6 @@
 {
     ".url": {
-        "fpkconverter.Application": {
+        "fpkconverter": {
             "title": "视频转码",
             "desc": "视频自动转码工具",
             "icon": "images/icon.png",
