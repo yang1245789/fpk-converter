@@ -111,9 +111,10 @@ class VideoConverter:
     ALLOWED_CONTAINERS = {'mp4', 'mkv'}
     ALLOWED_PRESETS = {'ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'}
     
-    MAX_BITRATE = 13 * 1000 * 1000
-    SKIP_THRESHOLD = 10 * 1000 * 1000
-    TRANSCODE_DELAY = 900
+    MAX_BITRATE = 13 * 1000 * 1000  # 13 Mbps
+    SKIP_FILE_SIZE = 10 * 1000 * 1000  # 10 MB - 小于此大小的文件跳过
+    SKIP_BITRATE = 5000 * 1000  # 5000 kbps = 5 Mbps - HEVC 1080p 低于此码率跳过
+    TRANSCODE_DELAY = 900  # 15 分钟
     TEMP_MAX_GB = 30
 
     def __init__(self, db, target_quality=23, codec='libx264', container='mp4',
@@ -265,10 +266,10 @@ class VideoConverter:
         height = video_info.get('height', 0)
         bit_rate = video_info.get('bit_rate', 0)
         is_hevc = codec in ['hevc', 'h265', 'h.265']
-        is_1080p = height == 1080
-        is_low_bitrate = bit_rate > 0 and bit_rate < self.SKIP_THRESHOLD
-        if is_hevc and is_1080p and is_low_bitrate:
-            print(f"检测到 1080p HEVC 视频，码率 {bit_rate / 1000000:.2f} Mbps < 10 Mbps，跳过转码")
+        is_1080p_or_lower = height <= 1080
+        is_low_bitrate = bit_rate > 0 and bit_rate < self.SKIP_BITRATE
+        if is_hevc and is_1080p_or_lower and is_low_bitrate:
+            print(f"检测到 {height}p HEVC 视频，码率 {bit_rate / 1000000:.2f} Mbps < {self.SKIP_BITRATE / 1000000:.0f} Mbps，跳过转码")
             return True
         return False
 
@@ -391,18 +392,36 @@ class VideoConverter:
     def _convert_video_impl(self, input_path):
         input_path = Path(input_path)
         if not self.is_video_file(input_path):
+            print(f"非视频文件，跳过: {input_path}")
             return False, 0
 
         input_path = self._validate_path(input_path)
         if not input_path:
+            print(f"路径验证失败，跳过: {input_path}")
             return False, 0
 
         if self.db.is_file_processed(input_path):
+            print(f"已处理过，跳过: {input_path}")
             return False, 0
 
         original_size = self.get_file_size(input_path)
         if original_size is None:
+            print(f"获取文件大小失败，跳过: {input_path}")
             return False, 0
+
+        if original_size < self.SKIP_FILE_SIZE:
+            print(f"文件太小 ({original_size / (1024*1024):.2f} MB < 10 MB)，跳过: {input_path}")
+            self.db.add_processed_file(input_path, original_size, True, 0)
+            return True, 0
+
+        # 检查 ffmpeg 是否可用
+        try:
+            subprocess.run(['ffmpeg', '-version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        except FileNotFoundError:
+            print("错误: ffmpeg 未安装或不在 PATH 中，无法转码")
+            return False, 0
+        except Exception as e:
+            print(f"检查 ffmpeg 失败: {e}")
 
         video_info = self.get_video_info(input_path)
         if not video_info:
@@ -414,7 +433,7 @@ class VideoConverter:
         bit_rate = video_info.get('bit_rate', 0)
         bit_rate_mbps = bit_rate / 1000000 if bit_rate > 0 else 0
         
-        print(f"视频信息: {width}x{height}, 编码: {codec}, 码率: {bit_rate_mbps:.2f} Mbps")
+        print(f"视频信息: {width}x{height}, 编码: {codec}, 码率: {bit_rate_mbps:.2f} Mbps, 大小: {original_size / (1024*1024):.2f} MB")
         
         if self.should_skip_transcode(video_info):
             self.db.add_processed_file(input_path, original_size, True, 0)
@@ -450,67 +469,71 @@ class VideoConverter:
             import tempfile
             output_path = Path(tempfile.gettempdir()) / f"fpkc_{input_path.stem}_temp_{unique_id}.{self.container}"
         
-        cmd = ['ffmpeg', '-i', str(input_path)]
+        # 根据编码器类型选择正确的参数
+        is_qsv = target_codec.endswith('_qsv')
+        cmd = ['ffmpeg', '-hide_banner', '-nostats', '-i', str(input_path)]
         cmd.extend(['-c:v', target_codec])
-        cmd.extend(['-maxrate', f'{self.MAX_BITRATE}'])
-        cmd.extend(['-bufsize', f'{self.MAX_BITRATE * 2}'])
-        
-        if self.use_gpu:
+
+        if is_qsv:
+            # QSV 编码器参数
+            cmd.extend(['-preset', 'medium'])
             cmd.extend(['-global_quality', str(self.target_quality)])
+            # QSV 不需要 -maxrate/-bufsize，用 -look_ahead 提升质量
         else:
+            # CPU 编码器参数
+            cmd.extend(['-preset', self.preset])
             cmd.extend(['-crf', str(self.target_quality)])
-        
+            cmd.extend(['-maxrate', f'{self.MAX_BITRATE}'])
+            cmd.extend(['-bufsize', f'{self.MAX_BITRATE * 2}'])
+
         if needs_resize:
             cmd.extend(['-vf', f'scale={target_width}:{target_height}'])
-        
-        cmd.extend(['-threads', str(self.threads)])
+
         cmd.extend(['-c:a', 'copy'])
+        cmd.extend(['-movflags', '+faststart'])
         cmd.extend(['-y', str(output_path)])
 
-        ffmpeg_log = self.temp_dir / f"ffmpeg_{unique_id}.log" if (self.temp_dir and self.temp_dir.is_dir()) else None
+        print(f"ffmpeg 命令: {' '.join(cmd)}")
+
+        # 始终创建 ffmpeg 日志文件，确保错误可追踪
+        log_dir = self.temp_dir if (self.temp_dir and self.temp_dir.is_dir()) else Path(tempfile.gettempdir())
+        log_dir.mkdir(parents=True, exist_ok=True)
+        ffmpeg_log = log_dir / f"ffmpeg_{unique_id}.log"
         try:
-            if ffmpeg_log:
-                with open(ffmpeg_log, 'w') as log_file:
-                    result = subprocess.run(cmd, stdout=log_file, stderr=subprocess.STDOUT, timeout=3600)
-            else:
-                result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3600)
-            
+            with open(ffmpeg_log, 'w') as log_file:
+                print(f"ffmpeg 日志: {ffmpeg_log}")
+                result = subprocess.run(cmd, stdout=log_file, stderr=subprocess.STDOUT, timeout=3600)
+
             if result.returncode != 0:
                 err_msg = 'Unknown error'
-                if ffmpeg_log and ffmpeg_log.exists():
-                    try: err_msg = ffmpeg_log.read_text()[-500:]
+                if ffmpeg_log.exists():
+                    try: err_msg = ffmpeg_log.read_text()[-1000:]
                     except: pass
-                    try: ffmpeg_log.unlink()
-                    except: pass
-                print(f"FFmpeg 错误: {err_msg}")
+                print(f"FFmpeg 错误 (返回码 {result.returncode}): {err_msg}")
+                # 保留日志文件用于调试
                 self.db.add_processed_file(input_path, original_size, False)
                 if output_path.exists():
                     try: output_path.unlink()
                     except: pass
                 return False, 0
         except subprocess.TimeoutExpired:
-            print(f"FFmpeg 转码超时: {input_path}")
-            if ffmpeg_log and ffmpeg_log.exists():
-                try: ffmpeg_log.unlink()
-                except: pass
+            print(f"FFmpeg 转码超时(1小时): {input_path}")
+            self.db.add_processed_file(input_path, original_size, False)
             if output_path.exists():
                 try: output_path.unlink()
                 except: pass
-            self.db.add_processed_file(input_path, original_size, False)
             return False, 0
         except FileNotFoundError:
-            print("ffmpeg 未安装")
-            if ffmpeg_log and ffmpeg_log.exists():
-                try: ffmpeg_log.unlink()
-                except: pass
+            print("ffmpeg 未安装或不在 PATH 中")
             self.db.add_processed_file(input_path, original_size, False)
             return False, 0
         except Exception as e:
             print(f"转码失败: {e}")
-            if ffmpeg_log and ffmpeg_log.exists():
-                try: ffmpeg_log.unlink()
-                except: pass
+            traceback.print_exc()
             self.db.add_processed_file(input_path, original_size, False)
+            if output_path.exists():
+                try: output_path.unlink()
+                except: pass
             return False, 0
 
         converted_size = self.get_file_size(output_path)

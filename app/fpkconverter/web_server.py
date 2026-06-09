@@ -150,20 +150,52 @@ def api_start():
         'threads':cfg.get('threads',1), 'use_gpu':cfg.get('use_gpu',True),
         'temp_dir': TEMP_DIR, 'max_depth': 3}, f)
     sc = os.path.join(VAR_DIR, 'start_converter.py')
-    with open(sc,'w') as f: f.write(
-        'import sys,os,json\n'
-        'sd=os.path.dirname(os.path.abspath(__file__))\n'
-        'jv=os.environ.get("TRIM_PKGVAR") or os.path.join(sd,"..","app","fpkconverter","data")\n'
-        'with open(os.path.join(jv,"start_config.json")) as fh:c=json.load(fh)\n'
-        'sys.path.insert(0,c["code_dir"])\n'
-        'pk=os.path.join(c["code_dir"],"packages")\n'
-        'if os.path.isdir(pk):\n'
-        '    sys.path.insert(0,pk)\n'
-        'from fpk_converter import Database,VideoConverter,FolderScanner\n'
-        'db=Database(c["db_path"])\n'
-        'td=c.get("temp_dir","")\n'
-        'vc=VideoConverter(db,c["crf"],c["codec"],c["container"],c["preset"],c["threads"],c["use_gpu"],temp_dir=td if td else None)\n'
-        'FolderScanner(c["monitor_dir"],vc,max_depth=c.get("max_depth",3)).start()')
+    script_content = '''import sys,os,json,subprocess,traceback
+sd=os.path.dirname(os.path.abspath(__file__))
+print("=== 转码进程启动 ===")
+print(f"Python: {sys.executable}")
+print(f"PID: {os.getpid()}")
+print(f"CWD: {os.getcwd()}")
+print(f"PATH: {os.environ.get('PATH', 'N/A')}")
+# 检查 ffmpeg
+try:
+    r=subprocess.run(["ffmpeg","-version"],capture_output=True,text=True,timeout=10)
+    print(f"ffmpeg: 可用 (返回码 {r.returncode})")
+    if r.stdout:
+        first_line=r.stdout.strip().split("\\n")[0]
+        print(f"ffmpeg 版本: {first_line}")
+except FileNotFoundError:
+    print("ffmpeg: 未找到! 请确认已安装")
+except Exception as e:
+    print(f"ffmpeg 检查失败: {e}")
+# 检查 ffprobe
+try:
+    r=subprocess.run(["ffprobe","-version"],capture_output=True,text=True,timeout=10)
+    print("ffprobe: 可用")
+except FileNotFoundError:
+    print("ffprobe: 未找到!")
+except Exception as e:
+    print(f"ffprobe 检查失败: {e}")
+jv=os.environ.get("TRIM_PKGVAR") or os.path.join(sd,"..","app","fpkconverter","data")
+with open(os.path.join(jv,"start_config.json")) as fh:c=json.load(fh)
+print(f"配置: {json.dumps(c, indent=2)}")
+sys.path.insert(0,c["code_dir"])
+pk=os.path.join(c["code_dir"],"packages")
+if os.path.isdir(pk):
+    sys.path.insert(0,pk)
+from fpk_converter import Database,VideoConverter,FolderScanner
+db=Database(c["db_path"])
+td=c.get("temp_dir","")
+print(f"temp_dir: {td}")
+if td:
+    os.makedirs(td,exist_ok=True)
+    print(f"temp_dir 可写: {os.access(td, os.W_OK)}")
+vc=VideoConverter(db,c["crf"],c["codec"],c["container"],c["preset"],c["threads"],c["use_gpu"],temp_dir=td if td else None)
+print(f"编码器: {vc.codec}, GPU: {vc.use_gpu}")
+FolderScanner(c["monitor_dir"],vc,max_depth=c.get("max_depth",3)).start()
+'''
+    with open(sc, 'w') as f:
+        f.write(script_content)
     os.chmod(sc, 0o755)
     # 只在启动进程和更新状态时持锁，缩小锁范围
     with proc_lock:
