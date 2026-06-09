@@ -8,3 +8,4 @@ maintainer            = yang
 distributor           = yang
 desktop_uidir         = ui
 desktop_applaunchname = fpkconverter.Application
+install_type          = root
