@@ -1,49 +1,78 @@
 #!/bin/sh
+# fpkconverter cmd/main v11
+# 日志固定写入 /tmp/fpkconverter.log (tmpfs 一定存在)
 
-# === 路径定位（修复: fnpack去掉了app/前缀） ===
-# TRIM_PKG=/var/apps/fpkconverter (root) 或 /vol1/@appcenter/fpkconverter (data)
-# 实际结构: ${TRIM_PKG}/fpkconverter/web_server.py
+LOG="/tmp/fpkconverter.log"
+echo "=== $(date) arg=$1 ===" >> "$LOG"
+echo "TRIM_PKG=${TRIM_PKG:-EMPTY}" >> "$LOG"
+echo "TRIM_PKGVAR=${TRIM_PKGVAR:-EMPTY}" >> "$LOG"
+echo "SELF=$0" >> "$LOG"
 
-if [ -n "${TRIM_PKG}" ]; then
-    APP_DIR="${TRIM_PKG}/fpkconverter"
-else
-    APP_DIR="$(cd "$(dirname "$0")" && pwd)/../fpkconverter"
+# 定位 APP_DIR
+APP_DIR=""
+if [ -n "${TRIM_PKG}" ] && [ -d "${TRIM_PKG}" ]; then
+    # 尝试多种路径
+    for d in "${TRIM_PKG}/fpkconverter" "${TRIM_PKG}/app/fpkconverter"; do
+        if [ -f "$d/web_server.py" ]; then
+            APP_DIR="$d"
+            break
+        fi
+    done
 fi
 
-# 兜底: /var/apps/fpkconverter/fpkconverter
-[ ! -f "$APP_DIR/web_server.py" ] && APP_DIR="/var/apps/fpkconverter/fpkconverter"
-# 再兜底: /vol1/@appcenter/fpkconverter/fpkconverter
-[ ! -f "$APP_DIR/web_server.py" ] && APP_DIR="/vol1/@appcenter/fpkconverter/fpkconverter"
+if [ -z "$APP_DIR" ]; then
+    for d in /var/apps/fpkconverter/fpkconverter \
+             /var/apps/fpkconverter/app/fpkconverter \
+             /vol1/@appcenter/fpkconverter/fpkconverter \
+             /vol1/@appcenter/fpkconverter/app/fpkconverter; do
+        if [ -f "$d/web_server.py" ]; then
+            APP_DIR="$d"
+            break
+        fi
+    done
+fi
+
+echo "APP_DIR=${APP_DIR:-NOT_FOUND}" >> "$LOG"
 
 # 数据目录
-[ -n "${TRIM_PKGVAR}" ] && VAR_DIR="${TRIM_PKGVAR}" || VAR_DIR="$APP_DIR/data"
-mkdir -p "$VAR_DIR" 2>/dev/null || true
-
-PID_FILE="$VAR_DIR/app.pid"
-LOG_FILE="$VAR_DIR/app.log"
-
-# 调试日志
-echo "$(date) $1 APP=$APP_DIR VAR=$VAR_DIR PKG=${TRIM_PKG:-none} PKGVAR=${TRIM_PKGVAR:-none}" >> "$APP_DIR/boot.log" 2>/dev/null || true
+VAR="${TRIM_PKGVAR:-${APP_DIR:-/tmp}/data}"
+mkdir -p "$VAR" 2>/dev/null
+PID="$VAR/app.pid"
 
 check() {
-    [ -f "$PID_FILE" ] || return 1
-    _p=$(head -n1 "$PID_FILE" 2>/dev/null | tr -d '[:space:]')
-    [ -n "$_p" ] && kill -0 "$_p" 2>/dev/null
+    [ -f "$PID" ] || return 1
+    p=$(head -n1 "$PID" 2>/dev/null | tr -d '[:space:]')
+    [ -n "$p" ] && kill -0 "$p" 2>/dev/null
 }
 
 case $1 in
 start)
-    check && exit 0
-    [ -f "$APP_DIR/web_server.py" ] || { echo "FAIL web_server.py not found at $APP_DIR" >> "$APP_DIR/boot.log" 2>/dev/null; exit 1; }
-    cd "$APP_DIR" || exit 1
+    if check; then
+        echo "already running" >> "$LOG"
+        exit 0
+    fi
+    if [ -z "$APP_DIR" ] || [ ! -f "$APP_DIR/web_server.py" ]; then
+        echo "FAIL: web_server.py not found" >> "$LOG"
+        echo "Listing TRIM_PKG:" >> "$LOG"
+        ls -laR "${TRIM_PKG:-/dev/null}" 2>/dev/null >> "$LOG"
+        exit 1
+    fi
+    echo "Starting python3 at $APP_DIR" >> "$LOG"
+    cd "$APP_DIR" || { echo "FAIL cd" >> "$LOG"; exit 1; }
     export PYTHONPATH="$APP_DIR/packages:$PYTHONPATH"
-    python3 web_server.py >> "$LOG_FILE" 2>&1 &
-    echo $! > "$PID_FILE"
-    echo "OK PID=$!" >> "$APP_DIR/boot.log" 2>/dev/null || true
+    python3 web_server.py >> "$VAR/app.log" 2>&1 &
+    echo $! > "$PID"
+    echo "Started PID=$!" >> "$LOG"
     exit 0
     ;;
 stop)
-    [ -f "$PID_FILE" ] && { _p=$(head -n1 "$PID_FILE" | tr -d '[:space:]'); kill -TERM "$_p" 2>/dev/null; sleep 1; kill -KILL "$_p" 2>/dev/null; rm -f "$PID_FILE"; }
+    if [ -f "$PID" ]; then
+        p=$(head -n1 "$PID" | tr -d '[:space:]')
+        kill -TERM "$p" 2>/dev/null
+        sleep 1
+        kill -KILL "$p" 2>/dev/null
+        rm -f "$PID"
+    fi
     exit 0
     ;;
 status)
