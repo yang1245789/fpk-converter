@@ -1,37 +1,41 @@
 #!/bin/sh
-# v12 - 基于真实诊断日志修复
-# 事实: TRIM_PKG为空, TRIM_PKGVAR=/vol1/@appdata/fpkconverter
-# 策略: 用dirname $0定位, 不依赖TRIM_PKG
+# v13 - 基于真实目录结构修复
+# 事实: cmd在/var/apps/fpkconverter/, app在/vol2/@appcenter/fpkconverter/
+# 通过 target 软链接找到 app 目录
 
-LOG="/vol1/@appdata/fpkconverter/info.log"
-mkdir -p /vol1/@appdata/fpkconverter 2>/dev/null
+LOG="/vol2/@appdata/fpkconverter/info.log"
+mkdir -p /vol2/@appdata/fpkconverter 2>/dev/null
 
 echo "=== $(date) arg=$1 ===" >> "$LOG"
-echo "TRIM_PKG=${TRIM_PKG:-EMPTY}" >> "$LOG"
-echo "TRIM_PKGVAR=${TRIM_PKGVAR:-EMPTY}" >> "$LOG"
-echo "SELF=$0" >> "$LOG"
 
-# 用 $0 定位安装根目录
-SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
-echo "SELF_DIR=$SELF_DIR" >> "$LOG"
-echo "ls SELF_DIR:" >> "$LOG"
-ls -la "$SELF_DIR/" >> "$LOG" 2>&1
-echo "ls SELF_DIR/..:" >> "$LOG"
-ls -la "$SELF_DIR/../" >> "$LOG" 2>&1
+# 定位安装根目录
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+echo "ROOT=$ROOT" >> "$LOG"
 
-# 在安装根目录下找 web_server.py
+# 尝试 target 软链接
 APP_DIR=""
-for d in "$SELF_DIR/../fpkconverter" \
-         "$SELF_DIR/../app/fpkconverter" \
-         "$SELF_DIR/../../fpkconverter" \
-         "$SELF_DIR/../../app/fpkconverter"; do
-    if [ -f "$d/web_server.py" ]; then
-        APP_DIR="$d"
-        break
-    fi
-done
+if [ -L "$ROOT/target" ]; then
+    TARGET="$(readlink "$ROOT/target")"
+    echo "TARGET=$TARGET" >> "$LOG"
+    for d in "$TARGET/fpkconverter" "$TARGET/app/fpkconverter"; do
+        if [ -f "$d/web_server.py" ]; then
+            APP_DIR="$d"
+            break
+        fi
+    done
+fi
 
-# 兜底: 从 TRIM_PKGVAR 推测
+# 回退: 直接在 ROOT 下找
+if [ -z "$APP_DIR" ]; then
+    for d in "$ROOT/fpkconverter" "$ROOT/app/fpkconverter"; do
+        if [ -f "$d/web_server.py" ]; then
+            APP_DIR="$d"
+            break
+        fi
+    done
+fi
+
+# 回退: TRIM_PKGVAR 的父目录
 if [ -z "$APP_DIR" ] && [ -n "${TRIM_PKGVAR}" ]; then
     BASE="$(dirname "$TRIM_PKGVAR")"
     for d in "$BASE/fpkconverter" "$BASE/app/fpkconverter"; do
@@ -49,7 +53,7 @@ if [ -n "$APP_DIR" ]; then
     ls -la "$APP_DIR/" >> "$LOG" 2>&1
 fi
 
-VAR="${TRIM_PKGVAR:-/vol1/@appdata/fpkconverter}"
+VAR="${TRIM_PKGVAR:-/vol2/@appdata/fpkconverter}"
 mkdir -p "$VAR" 2>/dev/null
 PID="$VAR/app.pid"
 
@@ -69,9 +73,9 @@ start)
         echo "FAIL: web_server.py not found" >> "$LOG"
         exit 1
     fi
-    cd "$APP_DIR" || { echo "FAIL cd to $APP_DIR" >> "$LOG"; exit 1; }
+    cd "$APP_DIR" || { echo "FAIL cd" >> "$LOG"; exit 1; }
     export PYTHONPATH="$APP_DIR/packages:$PYTHONPATH"
-    echo "Starting: python3 $APP_DIR/web_server.py" >> "$LOG"
+    echo "Starting python3 at $APP_DIR" >> "$LOG"
     python3 web_server.py >> "$VAR/app.log" 2>&1 &
     echo $! > "$PID"
     echo "Started PID=$!" >> "$LOG"
