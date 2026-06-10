@@ -8,6 +8,10 @@
             },
             {
                 "type": "tips",
+                "helpText": "<b>硬件转码提示：</b>为了访问 <code>/dev/dri/renderD*</code> 并启用 Intel QSV，本地自用版会按飞牛官方手册的 Root 权限模式运行。请仅在信任本应用来源时安装。"
+            },
+            {
+                "type": "tips",
                 "helpText": "请确认系统已安装 <code>ffmpeg</code>。如未安装，可在 SSH 终端执行 <code>apt-get install ffmpeg</code>。"
             }
         ]

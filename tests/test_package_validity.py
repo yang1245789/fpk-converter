@@ -1,4 +1,5 @@
 import os
+import json
 import shutil
 import subprocess
 import tarfile
@@ -56,6 +57,10 @@ class FpkPackageValidityTests(unittest.TestCase):
         self.assertIn("fnpack", content)
         self.assertIn("build", content)
         self.assertIn("__pycache__", content)
+
+    def test_hardware_transcode_build_runs_as_root_for_dri_access(self):
+        privilege = json.loads((REPO_ROOT / "config" / "privilege").read_text())
+        self.assertEqual(privilege["defaults"]["run-as"], "root")
 
     def test_fnpack_builds_installable_layout_without_python_cache(self):
         self._clean_python_cache()
