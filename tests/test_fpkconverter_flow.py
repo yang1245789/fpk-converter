@@ -301,6 +301,75 @@ class ConverterLogicTests(unittest.TestCase):
         ffmpeg_cmd = next(cmd for cmd in captured_cmds if cmd and cmd[0] == "ffmpeg" and "-i" in cmd)
         self.assertNotIn("+faststart", ffmpeg_cmd)
 
+    def test_qsv_failure_falls_back_to_cpu_encoder_once(self):
+        vc = self.converter_module.VideoConverter(
+            self.db,
+            target_quality=23,
+            codec="libx264",
+            container="mp4",
+            preset="medium",
+            use_gpu=True,
+            temp_dir=str(self.work),
+        )
+        vc.get_video_info = lambda path: {"width": 1920, "height": 1080, "codec": "h264", "bit_rate": 8_000_000}
+        ffmpeg_cmds = []
+
+        def fake_run(cmd, stdout=None, stderr=None, timeout=None, **kwargs):
+            if cmd[:2] == ["ffmpeg", "-version"]:
+                return subprocess.CompletedProcess(cmd, 0)
+            if cmd and cmd[0] == "ffmpeg" and "-i" in cmd:
+                ffmpeg_cmds.append(cmd)
+                if "h264_qsv" in cmd:
+                    return subprocess.CompletedProcess(cmd, 1)
+                output_path = Path(cmd[-1])
+                output_path.write_bytes(b"x" * 1000)
+                return subprocess.CompletedProcess(cmd, 0)
+            return subprocess.CompletedProcess(cmd, 0)
+
+        self.converter_module.subprocess.run = fake_run
+
+        success, _ = vc.convert_video(self.video)
+
+        self.assertTrue(success)
+        self.assertEqual(len(ffmpeg_cmds), 2)
+        self.assertIn("h264_qsv", ffmpeg_cmds[0])
+        self.assertIn("libx264", ffmpeg_cmds[1])
+
+    def test_temp_output_filename_is_short_and_safe(self):
+        weird_video = self.work / ("A" * 120 + " @[] 中文 spaces.mp4")
+        weird_video.write_bytes(b"x" * (11 * 1000 * 1000))
+        vc = self.converter_module.VideoConverter(
+            self.db,
+            target_quality=23,
+            codec="libx265",
+            container="mkv",
+            preset="medium",
+            use_gpu=False,
+            temp_dir=str(self.work),
+        )
+        vc.get_video_info = lambda path: {"width": 1920, "height": 1080, "codec": "h264", "bit_rate": 8_000_000}
+        ffmpeg_outputs = []
+
+        def fake_run(cmd, stdout=None, stderr=None, timeout=None, **kwargs):
+            if cmd[:2] == ["ffmpeg", "-version"]:
+                return subprocess.CompletedProcess(cmd, 0)
+            if cmd and cmd[0] == "ffmpeg" and "-i" in cmd:
+                output_path = Path(cmd[-1])
+                ffmpeg_outputs.append(output_path)
+                output_path.write_bytes(b"x" * 1000)
+                return subprocess.CompletedProcess(cmd, 0)
+            return subprocess.CompletedProcess(cmd, 0)
+
+        self.converter_module.subprocess.run = fake_run
+
+        vc.convert_video(weird_video)
+
+        self.assertEqual(len(ffmpeg_outputs), 1)
+        temp_name = ffmpeg_outputs[0].name
+        self.assertLessEqual(len(temp_name), 120)
+        for bad_char in " @[]":
+            self.assertNotIn(bad_char, temp_name)
+
 
 class PackageEntryPointTests(unittest.TestCase):
     def test_cmd_main_starts_web_server_with_unbuffered_logs(self):
