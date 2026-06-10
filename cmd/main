@@ -78,11 +78,12 @@ start)
     fi
     cd "$APP_DIR" || { echo "FAIL cd" >> "$LOG"; exit 1; }
     export PYTHONPATH="$APP_DIR/packages:$PYTHONPATH"
+    export PYTHONUNBUFFERED=1
     # 尝试 python3，回退到 python
     PYTHON="python3"
     command -v python3 >/dev/null 2>&1 || PYTHON="python"
     echo "Starting $PYTHON at $APP_DIR" >> "$LOG"
-    $PYTHON web_server.py >> "$VAR/app.log" 2>&1 &
+    $PYTHON -u web_server.py >> "$VAR/app.log" 2>&1 &
     echo $! > "$PID"
     echo "Started PID=$!" >> "$LOG"
     exit 0

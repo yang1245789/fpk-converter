@@ -490,7 +490,8 @@ class VideoConverter:
             cmd.extend(['-vf', f'scale={target_width}:{target_height}'])
 
         cmd.extend(['-c:a', 'copy'])
-        cmd.extend(['-movflags', '+faststart'])
+        if self.container == 'mp4':
+            cmd.extend(['-movflags', '+faststart'])
         cmd.extend(['-y', str(output_path)])
 
         print(f"ffmpeg 命令: {' '.join(cmd)}")

@@ -206,10 +206,12 @@ FolderScanner(c["monitor_dir"],vc,max_depth=c.get("max_depth",3)).start()
             except: pass
             conv_log_file = None
         conv_log_file = open(CONV_LOG, 'a')
-        # fnOS 中 sys.executable 可能为空，回退到 python3
+        # fnOS 中 sys.executable 可能为空，回退到 python3；使用无缓冲模式确保日志实时写入
         py = sys.executable if sys.executable else 'python3'
-        proc = subprocess.Popen([py, sc], cwd=VAR_DIR, start_new_session=True,
-                                stdout=conv_log_file, stderr=subprocess.STDOUT)
+        env = dict(os.environ)
+        env['PYTHONUNBUFFERED'] = '1'
+        proc = subprocess.Popen([py, '-u', sc], cwd=VAR_DIR, start_new_session=True,
+                                stdout=conv_log_file, stderr=subprocess.STDOUT, env=env)
     # 非阻塞健康检查：3秒后验证
     def _health_check():
         global proc, last_error, conv_log_file
@@ -233,7 +235,8 @@ def api_stop():
         last_error = ''
         if proc:
             try:
-                proc.terminate()
+                import signal
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                 proc.wait(timeout=10)
             except Exception:
                 try:
