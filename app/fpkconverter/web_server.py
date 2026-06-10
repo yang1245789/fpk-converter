@@ -53,9 +53,9 @@ BLOCKED_PATH_PREFIXES = (
     '/bin', '/boot', '/dev', '/etc', '/lib', '/lib64', '/proc', '/root',
     '/run', '/sbin', '/sys', '/usr', '/var'
 )
-ROOT_BROWSE_CANDIDATES = (
-    '/vol1', '/vol2', '/vol3', '/volume1', '/volume2', '/volume3',
-    '/mnt', '/media', '/home', '/share', '/shares', '/tmp'
+FIXED_VOLUME_ENTRYPOINTS = tuple(f'/vol{i}' for i in range(1, 10))
+ROOT_BROWSE_CANDIDATES = FIXED_VOLUME_ENTRYPOINTS + (
+    '/volume1', '/volume2', '/volume3', '/mnt', '/media', '/home', '/share', '/shares', '/tmp'
 )
 cfg = dict(DEFAULT)
 proc = None
@@ -410,7 +410,11 @@ def api_browse():
         if p == '/':
             # 根目录只暴露常见媒体/挂载入口，避免用户误选系统目录。
             for full in ROOT_BROWSE_CANDIDATES:
-                if os.path.exists(full) and not _is_blocked_system_path(full):
+                if _is_blocked_system_path(full):
+                    continue
+                if full in FIXED_VOLUME_ENTRYPOINTS:
+                    entries.append({'name':os.path.basename(full), 'path':full, 'is_dir':True})
+                elif os.path.exists(full):
                     entries.append({'name':os.path.basename(full) or full, 'path':full, 'is_dir':os.path.isdir(full)})
         else:
             # 非根目录：先尝试 listdir，权限不足时尝试 isdir 回退

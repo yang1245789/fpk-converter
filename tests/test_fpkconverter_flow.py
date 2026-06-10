@@ -187,6 +187,22 @@ class WebServerFlowTests(unittest.TestCase):
         for entry in data["entries"]:
             self.assertNotIn(entry["path"], {"/proc", "/sys", "/dev", "/etc", "/usr", "/var", "/run"})
 
+    def test_root_browse_exposes_fnnas_volume_entry_even_when_not_enumerable(self):
+        response = self.client.get("/api/browse", query_string={"path": "/"})
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        paths = {entry["path"] for entry in data["entries"]}
+        self.assertIn("/vol3", paths)
+
+    def test_save_config_allows_explicit_fnnas_volume_path(self):
+        response = self.client.post("/api/config", json={"monitor_dir": "/vol3/1000/PORN"})
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data["success"])
+        self.assertEqual(data["config"]["monitor_dir"], "/vol3/1000/PORN")
+
     def test_start_stop_buttons_create_runtime_files_and_update_status(self):
         self.client.post("/api/config", json={"monitor_dir": str(self.monitor_dir)})
         fake_proc = FakeProc()
