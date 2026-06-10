@@ -591,15 +591,13 @@ class VideoConverter:
             self.db.add_processed_file(input_path, original_size, True, 0)
             return True, 0
         
-        # 尊重用户选择的编码器；如果本进程已检测到 QSV 不可用，则直接走 CPU，避免每个文件都先失败一次。
-        if self.use_gpu and not self._qsv_disabled and self.codec in ('libx265', 'hevc_qsv'):
+        # 勾选 GPU 时严格只使用 QSV；QSV 不可用就失败停止，不再自动 CPU 降级。
+        if self.use_gpu and self.codec in ('libx265', 'hevc_qsv'):
             target_codec = 'hevc_qsv'
-        elif self.use_gpu and not self._qsv_disabled and self.codec == 'libx264':
+        elif self.use_gpu and self.codec == 'libx264':
             target_codec = 'h264_qsv'
         else:
             target_codec = self.codec
-        if self._qsv_disabled and self.use_gpu:
-            print("QSV 已在本次运行中被判定不可用，直接使用 CPU 编码器")
         
         target_width, target_height = width, height
         needs_resize = False
@@ -643,6 +641,14 @@ class VideoConverter:
                     try: err_msg = ffmpeg_log.read_text()[-1000:]
                     except: pass
                 print(f"FFmpeg 错误 (返回码 {result.returncode}): {err_msg}")
+                if self.use_gpu and target_codec.endswith('_qsv'):
+                    print("GPU 转码失败：已勾选 GPU 加速，按设置不进行 CPU 降级，停止当前文件")
+                    self._qsv_disabled = True
+                    self.db.add_processed_file(input_path, original_size, False)
+                    if output_path.exists():
+                        try: output_path.unlink()
+                        except: pass
+                    return False, 0
                 fallback_codec = self._cpu_fallback_codec(target_codec)
                 if fallback_codec:
                     self._qsv_disabled = True

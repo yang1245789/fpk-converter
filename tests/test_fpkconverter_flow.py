@@ -585,7 +585,7 @@ class ConverterLogicTests(unittest.TestCase):
         self.assertEqual(remaining, 0)
         self.assertIn("已失败 3 次", reason)
 
-    def test_qsv_failure_falls_back_to_cpu_encoder_once(self):
+    def test_gpu_mode_qsv_failure_stops_without_cpu_fallback(self):
         vc = self.converter_module.VideoConverter(
             self.db,
             target_quality=23,
@@ -614,12 +614,11 @@ class ConverterLogicTests(unittest.TestCase):
 
         success, _ = vc.convert_video(self.video)
 
-        self.assertTrue(success)
-        self.assertEqual(len(ffmpeg_cmds), 2)
+        self.assertFalse(success)
+        self.assertEqual(len(ffmpeg_cmds), 1)
         self.assertIn("h264_qsv", ffmpeg_cmds[0])
-        self.assertIn("libx264", ffmpeg_cmds[1])
 
-    def test_qsv_fallback_uses_medium_cpu_preset_instead_of_slow(self):
+    def test_gpu_mode_hevc_qsv_failure_does_not_use_libx265_fallback(self):
         vc = self.converter_module.VideoConverter(
             self.db,
             target_quality=23,
@@ -648,10 +647,10 @@ class ConverterLogicTests(unittest.TestCase):
 
         success, _ = vc.convert_video(self.video)
 
-        self.assertTrue(success)
-        fallback_cmd = ffmpeg_cmds[1]
-        self.assertIn("libx265", fallback_cmd)
-        self.assertEqual(fallback_cmd[fallback_cmd.index("-preset") + 1], "medium")
+        self.assertFalse(success)
+        self.assertEqual(len(ffmpeg_cmds), 1)
+        self.assertIn("hevc_qsv", ffmpeg_cmds[0])
+        self.assertFalse(any("libx265" in cmd for cmd in ffmpeg_cmds))
 
     def test_temp_output_filename_is_short_and_safe(self):
         weird_video = self.work / ("A" * 120 + " @[] 中文 spaces.mp4")
