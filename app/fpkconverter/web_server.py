@@ -399,16 +399,22 @@ sys.path.insert(0,c["code_dir"])
 pk=os.path.join(c["code_dir"],"packages")
 if os.path.isdir(pk):
     sys.path.insert(0,pk)
-from fpk_converter import Database,VideoConverter,FolderScanner
-db=Database(c["db_path"])
+import fpk_converter as fpkc
+db=fpkc.Database(c["db_path"])
 td=c.get("temp_dir","")
 print(f"temp_dir: {td}")
 if td:
     os.makedirs(td,exist_ok=True)
     print(f"temp_dir 可写: {os.access(td, os.W_OK)}")
-vc=VideoConverter(db,c["crf"],c["codec"],c["container"],c["preset"],c["threads"],c["use_gpu"],temp_dir=td if td else None)
+vc=fpkc.VideoConverter(db,c["crf"],c["codec"],c["container"],c["preset"],c["threads"],c["use_gpu"],temp_dir=td if td else None)
 print(f"编码器: {vc.codec}, GPU: {vc.use_gpu}")
-FolderScanner(c["monitor_dir"],vc,max_depth=c.get("max_depth",3)).start()
+ok,msg=vc.preflight_check(c["monitor_dir"])
+print(f"启动前功能自检结果: {msg}")
+if not ok:
+    print("启动前功能自检失败，停止进入正式转码流程")
+    sys.exit(2)
+print("启动前功能自检通过，进入正式扫描流程")
+fpkc.FolderScanner(c["monitor_dir"],vc,max_depth=c.get("max_depth",3)).start()
 '''
     with open(sc, 'w') as f:
         f.write(script_content)

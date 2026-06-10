@@ -772,6 +772,46 @@ class ConverterLogicTests(unittest.TestCase):
         self.assertIn("-qsv_device", ffmpeg_cmds[0])
         self.assertEqual(ffmpeg_cmds[0][ffmpeg_cmds[0].index("-qsv_device") + 1], "/dev/dri/renderD128")
 
+    def test_preflight_gpu_success_runs_tiny_qsv_probe_before_scanning(self):
+        vc = self.converter_module.VideoConverter(self.db, use_gpu=True, temp_dir=str(self.work))
+        vc._render_devices = lambda: ["/dev/dri/renderD128"]
+        probe_cmds = []
+
+        def fake_run(cmd, stdout=None, stderr=None, timeout=None, env=None, **kwargs):
+            if "-version" in cmd:
+                return subprocess.CompletedProcess(cmd, 0)
+            if "-f" in cmd and "lavfi" in cmd and "h264_qsv" in cmd:
+                probe_cmds.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0)
+            return subprocess.CompletedProcess(cmd, 0)
+
+        self.converter_module.subprocess.run = fake_run
+
+        ok, message = vc.preflight_check(str(self.work))
+
+        self.assertTrue(ok, message)
+        self.assertEqual(len(probe_cmds), 1)
+        self.assertIn("-qsv_device", probe_cmds[0])
+        self.assertEqual(probe_cmds[0][probe_cmds[0].index("-qsv_device") + 1], "/dev/dri/renderD128")
+
+    def test_preflight_gpu_failure_stops_before_scanning(self):
+        vc = self.converter_module.VideoConverter(self.db, use_gpu=True, temp_dir=str(self.work))
+        vc._render_devices = lambda: ["/dev/dri/renderD128"]
+
+        def fake_run(cmd, stdout=None, stderr=None, timeout=None, env=None, **kwargs):
+            if "-version" in cmd:
+                return subprocess.CompletedProcess(cmd, 0)
+            if "-f" in cmd and "lavfi" in cmd:
+                return subprocess.CompletedProcess(cmd, 234, stderr=b"No VA display found")
+            return subprocess.CompletedProcess(cmd, 0)
+
+        self.converter_module.subprocess.run = fake_run
+
+        ok, message = vc.preflight_check(str(self.work))
+
+        self.assertFalse(ok)
+        self.assertIn("GPU/QSV 自检失败", message)
+
     def test_temp_output_filename_is_short_and_safe(self):
         weird_video = self.work / ("A" * 120 + " @[] 中文 spaces.mp4")
         weird_video.write_bytes(b"x" * (11 * 1000 * 1000))
@@ -821,6 +861,12 @@ class PackageEntryPointTests(unittest.TestCase):
 
         self.assertIn("os.killpg", signal_block)
         self.assertIn("SIGTERM", signal_block)
+
+    def test_start_script_runs_preflight_before_folder_scanner(self):
+        content = (APP_DIR / "web_server.py").read_text()
+
+        self.assertIn("vc.preflight_check", content)
+        self.assertLess(content.index("vc.preflight_check"), content.index("FolderScanner"))
 
 
 if __name__ == "__main__":

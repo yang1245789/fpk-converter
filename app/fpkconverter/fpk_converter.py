@@ -305,6 +305,87 @@ class VideoConverter:
         except Exception:
             return []
 
+    def _preflight_qsv_cmd(self, qsv_device):
+        cmd = [self._ffmpeg_binary(), '-hide_banner', '-nostats']
+        if qsv_device:
+            cmd.extend(['-qsv_device', qsv_device])
+        cmd.extend([
+            '-f', 'lavfi',
+            '-i', 'testsrc=size=128x72:rate=1',
+            '-t', '1',
+            '-c:v', 'h264_qsv',
+            '-f', 'null',
+            '-'
+        ])
+        return cmd
+
+    def _completed_process_output(self, result):
+        chunks = []
+        for attr in ('stdout', 'stderr'):
+            value = getattr(result, attr, None)
+            if not value:
+                continue
+            if isinstance(value, bytes):
+                value = value.decode('utf-8', errors='replace')
+            chunks.append(str(value))
+        return '\n'.join(chunks)[-1200:]
+
+    def preflight_check(self, monitor_dir):
+        print("=== 启动前功能自检 ===")
+        monitor_path = Path(monitor_dir)
+        if not monitor_path.is_dir():
+            return False, f"监控目录不存在或不是目录: {monitor_dir}"
+        if not os.access(str(monitor_path), os.R_OK):
+            return False, f"监控目录不可读: {monitor_dir}"
+        if self.temp_dir:
+            try:
+                self.temp_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                return False, f"临时目录创建失败: {self.temp_dir}，{e}"
+            if not os.access(str(self.temp_dir), os.W_OK):
+                return False, f"临时目录不可写: {self.temp_dir}"
+
+        env = self._ffmpeg_env()
+        for name, binary in (('ffmpeg', self._ffmpeg_binary()), ('ffprobe', self._ffprobe_binary())):
+            try:
+                result = subprocess.run([binary, '-version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        timeout=10, env=env)
+            except FileNotFoundError:
+                return False, f"{name} 未找到: {binary}"
+            except Exception as e:
+                return False, f"{name} 自检异常: {e}"
+            if result.returncode != 0:
+                return False, f"{name} 自检失败: {self._completed_process_output(result)}"
+            print(f"{name} 自检通过: {binary}")
+
+        if not self.use_gpu:
+            print("CPU 模式自检通过，进入正式扫描流程")
+            return True, "CPU 模式自检通过"
+
+        print(self._gpu_diagnostic_message())
+        print(f"QSV/GPU 环境: ffmpeg={self._ffmpeg_binary()}, "
+              f"LIBVA_DRIVER_NAME={env.get('LIBVA_DRIVER_NAME', '')}, "
+              f"LIBVA_DRIVERS_PATH={env.get('LIBVA_DRIVERS_PATH', '')}")
+        devices = self._render_devices()
+        if not devices:
+            return False, "GPU/QSV 自检失败: 未找到 /dev/dri/renderD* 设备"
+        last_error = ''
+        for device in devices:
+            print(f"GPU/QSV 自检: 尝试设备 {device}")
+            try:
+                result = subprocess.run(self._preflight_qsv_cmd(device), stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, timeout=30, env=env)
+            except Exception as e:
+                last_error = str(e)
+                print(f"GPU/QSV 自检异常: {device}，{e}")
+                continue
+            if result.returncode == 0:
+                print(f"GPU/QSV 自检通过: {device}")
+                return True, f"GPU/QSV 自检通过: {device}"
+            last_error = self._completed_process_output(result)
+            print(f"GPU/QSV 自检失败: {device}，{last_error}")
+        return False, f"GPU/QSV 自检失败，正式转码不会启动。最后错误: {last_error}"
+
     def get_file_size(self, filepath):
         try:
             return os.path.getsize(filepath)
