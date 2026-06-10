@@ -655,6 +655,17 @@ class ConverterLogicTests(unittest.TestCase):
         self.assertEqual(remaining, 0)
         self.assertIn("已失败 3 次", reason)
 
+    def test_queue_does_not_requeue_file_while_it_is_active(self):
+        vc = self.converter_module.VideoConverter(self.db)
+        vc._ensure_worker = lambda: None
+        vc._deduplicate_event = lambda filepath: True
+        active_path = str(self.video.resolve())
+        vc._active_paths.add(active_path)
+
+        vc.queue_file(self.video)
+
+        self.assertEqual(vc._queue, [])
+
     def test_gpu_mode_qsv_failure_stops_without_cpu_fallback(self):
         vc = self.converter_module.VideoConverter(
             self.db,
@@ -914,6 +925,11 @@ class PackageEntryPointTests(unittest.TestCase):
 
         self.assertIn("vc.preflight_check", content)
         self.assertLess(content.index("vc.preflight_check"), content.index("FolderScanner"))
+
+    def test_start_script_prints_converter_version(self):
+        content = (APP_DIR / "web_server.py").read_text()
+
+        self.assertIn("fpk_converter.VERSION", content)
 
 
 if __name__ == "__main__":

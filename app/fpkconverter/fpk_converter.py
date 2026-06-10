@@ -12,6 +12,8 @@ import hashlib
 import re
 from pathlib import Path
 
+VERSION = '1.0.49'
+
 
 class Database:
     def __init__(self, db_path=None):
@@ -139,6 +141,7 @@ class VideoConverter:
         if self.temp_dir and not self.temp_dir.exists():
             self.temp_dir.mkdir(parents=True, exist_ok=True)
         self._queue = []
+        self._active_paths = set()
         self._queue_lock = threading.Lock()
         self._worker_running = False
         self.recent_events = {}
@@ -528,6 +531,9 @@ class VideoConverter:
             return
         
         with self._queue_lock:
+            if filepath_str in self._active_paths:
+                print(f"文件已在等待或处理中，跳过重复入队: {filepath_str}")
+                return
             for item in self._queue:
                 if item['path'] == filepath_str:
                     return
@@ -557,41 +563,43 @@ class VideoConverter:
             filepath_str = item['path']
             filepath = Path(filepath_str)
             queued_at = item.get('queued_at', time.time())
+            with self._queue_lock:
+                self._active_paths.add(filepath_str)
             
-            wait_start = time.time()
-            last_wait_log = 0
-            while time.time() - wait_start < self.TRANSCODE_DELAY:
+            try:
+                wait_start = time.time()
+                last_wait_log = 0
+                while time.time() - wait_start < self.TRANSCODE_DELAY:
+                    if not os.path.exists(filepath_str):
+                        print(f"文件在等待期间被删除，跳过: {filepath_str}")
+                        break
+                    remaining = int(self.TRANSCODE_DELAY - (time.time() - wait_start))
+                    if last_wait_log == 0 or time.time() - last_wait_log >= 30 or remaining <= 5:
+                        print(f"文件已入队，等待文件稳定: {filepath_str}，剩余约 {max(0, remaining)} 秒")
+                        last_wait_log = time.time()
+                    time.sleep(5)
+                
                 if not os.path.exists(filepath_str):
-                    print(f"文件在等待期间被删除，跳过: {filepath_str}")
-                    break
-                remaining = int(self.TRANSCODE_DELAY - (time.time() - wait_start))
-                if last_wait_log == 0 or time.time() - last_wait_log >= 30 or remaining <= 5:
-                    print(f"文件已入队，等待文件稳定: {filepath_str}，剩余约 {max(0, remaining)} 秒")
-                    last_wait_log = time.time()
-                time.sleep(5)
-            
-            if not os.path.exists(filepath_str):
-                continue
-            
-            try:
-                mtime = os.path.getmtime(filepath_str)
-                if mtime > queued_at:
-                    # 限制重新入队次数，防止文件持续被修改导致无限循环
-                    retry_count = item.get('retry', 0)
-                    if retry_count >= 3:
-                        print(f"文件修改次数过多，跳过: {filepath_str}")
-                        continue
-                    print(f"文件在等待期间被修改，重新入队({retry_count+1}/3): {filepath_str}")
-                    with self._queue_lock:
-                        self._queue.append({'path': filepath_str, 'queued_at': time.time(), 'retry': retry_count + 1})
                     continue
-            except Exception:
-                pass
-            
-            self._enforce_temp_limit()
-            self._cleanup_transcode_logs()
-            
-            try:
+                
+                try:
+                    mtime = os.path.getmtime(filepath_str)
+                    if mtime > queued_at:
+                        # 限制重新入队次数，防止文件持续被修改导致无限循环
+                        retry_count = item.get('retry', 0)
+                        if retry_count >= 3:
+                            print(f"文件修改次数过多，跳过: {filepath_str}")
+                            continue
+                        print(f"文件在等待期间被修改，重新入队({retry_count+1}/3): {filepath_str}")
+                        with self._queue_lock:
+                            self._queue.append({'path': filepath_str, 'queued_at': time.time(), 'retry': retry_count + 1})
+                        continue
+                except Exception:
+                    pass
+                
+                self._enforce_temp_limit()
+                self._cleanup_transcode_logs()
+                
                 print(f"[SERIAL] 开始处理: {filepath_str}")
                 success, _ = self.convert_video(filepath)
                 if success:
@@ -602,6 +610,9 @@ class VideoConverter:
                 print(f"转码异常: {e}")
                 traceback.print_exc()
                 self._record_failure_for_retry(filepath_str)
+            finally:
+                with self._queue_lock:
+                    self._active_paths.discard(filepath_str)
             
             time.sleep(2)
 

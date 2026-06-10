@@ -399,7 +399,9 @@ sys.path.insert(0,c["code_dir"])
 pk=os.path.join(c["code_dir"],"packages")
 if os.path.isdir(pk):
     sys.path.insert(0,pk)
-import fpk_converter as fpkc
+import fpk_converter
+print(f"视频转码核心版本: {fpk_converter.VERSION}")
+fpkc=fpk_converter
 db=fpkc.Database(c["db_path"])
 td=c.get("temp_dir","")
 print(f"temp_dir: {td}")
