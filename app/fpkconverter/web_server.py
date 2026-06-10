@@ -407,6 +407,13 @@ def api_browse():
     if p.count('/') > 10:
         return jsonify({'error':'Path too deep'}), 400
     entries = []
+    def add_entry(name, path, is_dir=True, extra=None):
+        if any(e.get('path') == path for e in entries):
+            return
+        item = {'name':name, 'path':path, 'is_dir':is_dir}
+        if extra:
+            item.update(extra)
+        entries.append(item)
     try:
         if p == '/':
             # 根目录只暴露常见媒体/挂载入口，避免用户误选系统目录。
@@ -414,7 +421,11 @@ def api_browse():
                 if _is_blocked_system_path(full):
                     continue
                 if os.path.exists(full):
-                    entries.append({'name':os.path.basename(full) or full, 'path':full, 'is_dir':os.path.isdir(full)})
+                    add_entry(os.path.basename(full) or full, full, os.path.isdir(full))
+            saved_dir = cfg.get('monitor_dir', '')
+            normalized_saved, _ = _validate_user_directory(saved_dir, must_exist=False)
+            if normalized_saved and os.path.isdir(normalized_saved):
+                add_entry(f"当前监控目录: {normalized_saved}", normalized_saved, True, {'pinned':True})
         else:
             # 非根目录：先尝试 listdir，权限不足时尝试 isdir 回退
             try:
@@ -425,9 +436,9 @@ def api_browse():
                     full = os.path.join(p, item)
                     try:
                         is_dir = os.path.isdir(full)
-                        entries.append({'name':item, 'path':full, 'is_dir':is_dir})
+                        add_entry(item, full, is_dir)
                     except PermissionError:
-                        entries.append({'name':item, 'path':full, 'is_dir':True, 'no_access':True})
+                        add_entry(item, full, True, {'no_access':True})
                     except OSError:
                         pass
             except PermissionError:
@@ -484,10 +495,11 @@ function saveCfg(){let d={monitor_dir:el('monitor_dir').value,crf:parseInt(el('c
 async function refresh(){try{let s=await fetch('/api/status').then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});let b=el('badge');b.textContent=s.running?'运行中':'已停止';b.className='badge '+(s.running?'bg':'br');s.config&&(el('monitor_dir').value=s.config.monitor_dir,el('crf').value=s.config.crf,el('preset').value=s.config.preset,el('threads').value=s.config.threads,el('codec').value=s.config.codec,el('container').value=s.config.container,el('use_gpu').checked=s.config.use_gpu!==false);let p=s.process||{};el('process_pid').textContent=p.pid||'-';el('process_uptime').textContent=p.uptime_seconds!=null?(p.uptime_seconds+' 秒'):'-';el('current_file').textContent=p.current_file||'-';el('current_activity').textContent=p.current_activity||'-';el('last_error_text').textContent=s.error||p.last_error||'无';el('recent_log').textContent=(s.recent_log&&s.recent_log.length)?s.recent_log.join('\\n'):'暂无日志';let l=await fetch('/api/logs').then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});el('ts').textContent=l.total_saved_mb;el('tc2').textContent=l.logs.length;let t=el('tb');t.innerHTML='';l.logs.forEach(r=>{let tr=document.createElement('tr');['filepath','file_size_mb','saved_size_mb'].forEach(k=>{let td=document.createElement('td');td.textContent=r[k];tr.appendChild(td)});let sd=document.createElement('td');sd.textContent=r.success?'成功':'失败';sd.className=r.success?'suc':'err';tr.appendChild(sd);let td=document.createElement('td');td.textContent=r.processed_at;tr.appendChild(td);t.appendChild(tr)})}catch(e){console.error('refresh error:',e)}}
 function el(id){return document.getElementById(id)}
 var browsePath='/';
-async function openBrowser(p){if(p)browsePath=p;try{let d=await fetch('/api/browse?path='+encodeURIComponent(browsePath)).then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});if(d.error){alert(d.error);return}let m=el('modal'),lst=el('blist');el('bpath').textContent=d.path;lst.innerHTML='';if(d.path!=='/'){let b=document.createElement('div');b.className='bitem';b.textContent='.. 返回上级';b.onclick=()=>openBrowser(d.path.split('/').slice(0,-1).join('/')||'/');lst.appendChild(b)}d.entries.forEach(e=>{let b=document.createElement('div');b.className='bitem';b.textContent=e.name+(e.is_dir?'/':'');if(e.no_access){b.style.opacity='0.4';b.title='无权限';if(e.is_dir)b.onclick=()=>alert('无权限访问此目录')}else if(e.is_dir){b.onclick=()=>openBrowser(e.path)}else{b.style.opacity='0.5'}lst.appendChild(b)});m.style.display='flex'}catch(e){alert('浏览目录失败: '+e.message)}}
+async function openBrowser(p){if(p){browsePath=p}else{let v=(el('monitor_dir').value||'').trim();browsePath=v.startsWith('/')?v:'/'}try{let d=await fetch('/api/browse?path='+encodeURIComponent(browsePath)).then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});if(d.error){alert(d.error);return}let m=el('modal'),lst=el('blist');browsePath=d.path;el('bpath').textContent=d.path;if(el('browser_path_input'))el('browser_path_input').value=d.path;lst.innerHTML='';if(d.path!=='/'){let b=document.createElement('div');b.className='bitem';b.textContent='.. 返回上级';b.onclick=()=>openBrowser(d.path.split('/').slice(0,-1).join('/')||'/');lst.appendChild(b)}d.entries.forEach(e=>{let b=document.createElement('div');b.className='bitem';b.textContent=e.name+(e.is_dir?'/':'');if(e.pinned){b.style.fontWeight='600';b.title='已保存的监控目录'}if(e.no_access){b.style.opacity='0.4';b.title='无权限';if(e.is_dir)b.onclick=()=>alert('无权限访问此目录')}else if(e.is_dir){b.onclick=()=>openBrowser(e.path)}else{b.style.opacity='0.5'}lst.appendChild(b)});m.style.display='flex'}catch(e){alert('浏览目录失败: '+e.message)}}
+function openBrowserFromInput(){let p=(el('browser_path_input').value||'').trim();if(!p){alert('请输入完整路径');return}openBrowser(p)}
 function selectDir(){el('monitor_dir').value=browsePath;el('modal').style.display='none';saveCfg()}
 refresh();setInterval(refresh,5000)</script>
-<div id="modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:999;align-items:center;justify-content:center"><div style="background:#fff;border-radius:12px;width:90%;max-width:500px;max-height:70vh;display:flex;flex-direction:column"><div style="padding:16px 20px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;align-items:center"><span id="bpath" style="font-weight:600;font-size:14px">/</span><div><button class="btn bt2" style="padding:6px 14px;font-size:13px" onclick="selectDir()">选择此目录</button><button class="btn bt3" style="padding:6px 14px;font-size:13px;margin-left:6px" onclick="el('modal').style.display='none'">关闭</button></div></div><div id="blist" style="overflow-y:auto;flex:1;padding:8px 12px"></div></div></div>
+<div id="modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:999;align-items:center;justify-content:center"><div style="background:#fff;border-radius:12px;width:90%;max-width:560px;max-height:70vh;display:flex;flex-direction:column"><div style="padding:16px 20px;border-bottom:1px solid #e5e7eb"><div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><span id="bpath" style="font-weight:600;font-size:14px;word-break:break-all">/</span><div><button class="btn bt2" style="padding:6px 14px;font-size:13px" onclick="selectDir()">选择此目录</button><button class="btn bt3" style="padding:6px 14px;font-size:13px;margin-left:6px" onclick="el('modal').style.display='none'">关闭</button></div></div><div style="display:flex;gap:8px;margin-top:10px"><input id="browser_path_input" type="text" placeholder="可直接输入授权目录，如 /vol3/1000/PORN"><button class="btn bt1" style="padding:8px 12px;white-space:nowrap" onclick="openBrowserFromInput()">打开路径</button></div></div><div id="blist" style="overflow-y:auto;flex:1;padding:8px 12px"></div></div></div>
 <style>.bitem{padding:10px 12px;cursor:pointer;border-radius:6px;font-size:14px;color:#1f2937}.bitem:hover{background:#f3f4f6}</style></body></html>'''
 
 if __name__ == '__main__':

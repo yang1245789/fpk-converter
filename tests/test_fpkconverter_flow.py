@@ -99,6 +99,8 @@ class WebServerFlowTests(unittest.TestCase):
         self.assertIn("id=\"current_activity\"", html)
         self.assertIn("id=\"last_error_text\"", html)
         self.assertIn("id=\"recent_log\"", html)
+        self.assertIn("id=\"browser_path_input\"", html)
+        self.assertIn("openBrowserFromInput()", html)
 
     def test_home_page_javascript_is_syntax_valid(self):
         response = self.client.get("/")
@@ -218,6 +220,59 @@ class WebServerFlowTests(unittest.TestCase):
             self.assertIn(f"/vol{index}", paths)
         for index in range(6, 10):
             self.assertNotIn(f"/vol{index}", paths)
+
+    def test_root_browse_includes_saved_monitor_dir_even_when_parent_is_not_listable(self):
+        granted_dir = "/vol3/1000/PORN"
+        self.web.cfg["monitor_dir"] = granted_dir
+
+        def fake_exists(path):
+            if path in {"/vol3", "/vol3/1000"}:
+                return False
+            if path == granted_dir:
+                return True
+            return self.original_exists(path)
+
+        def fake_isdir(path):
+            if path == granted_dir:
+                return True
+            if path in {"/vol3", "/vol3/1000"}:
+                return False
+            return self.original_isdir(path)
+
+        self.web.os.path.exists = fake_exists
+        self.web.os.path.isdir = fake_isdir
+
+        response = self.client.get("/api/browse", query_string={"path": "/"})
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        paths = {entry["path"] for entry in data["entries"]}
+        self.assertIn(granted_dir, paths)
+
+    def test_browse_can_open_granted_leaf_directory_without_listing_parents(self):
+        granted_dir = "/vol3/1000/PORN"
+
+        def fake_listdir(path):
+            if path == granted_dir:
+                return ["movie.mp4"]
+            raise PermissionError(path)
+
+        def fake_isdir(path):
+            if path == granted_dir:
+                return True
+            if path == f"{granted_dir}/movie.mp4":
+                return False
+            return self.original_isdir(path)
+
+        self.web.os.listdir = fake_listdir
+        self.web.os.path.isdir = fake_isdir
+
+        response = self.client.get("/api/browse", query_string={"path": granted_dir})
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["path"], granted_dir)
+        self.assertEqual(data["entries"][0]["name"], "movie.mp4")
 
     def test_save_config_allows_explicit_fnnas_volume_path(self):
         response = self.client.post("/api/config", json={"monitor_dir": "/vol3/1000/PORN"})
