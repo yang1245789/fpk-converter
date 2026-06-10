@@ -116,11 +116,13 @@ class VideoConverter:
     MAX_BITRATE = 13 * 1000 * 1000  # 13 Mbps
     SKIP_FILE_SIZE = 10 * 1000 * 1000  # 10 MB - 小于此大小的文件跳过
     SKIP_BITRATE = 5000 * 1000  # 5000 kbps = 5 Mbps - HEVC 1080p 低于此码率跳过
-    TRANSCODE_DELAY = 900  # 15 分钟
+    TRANSCODE_DELAY = 300  # 5 分钟：等待文件写入稳定后再转码
     TEMP_MAX_GB = 30
     MIN_CRF = 18
     MAX_CRF = 32
     MAX_THREADS = 4
+    FAILURE_RETRY_DELAYS = (1800, 7200, 21600)  # 30分钟、2小时、6小时
+    MAX_FAILURE_RETRIES = 3
 
     def __init__(self, db, target_quality=23, codec='libx264', container='mp4',
                  preset='medium', threads=1, use_gpu=True, temp_dir=''):
@@ -139,6 +141,12 @@ class VideoConverter:
         self._worker_running = False
         self.recent_events = {}
         self.event_lock = threading.Lock()
+        self.failure_retry_state = {}
+        self.failure_lock = threading.Lock()
+        self._qsv_disabled = False
+
+    def _now(self):
+        return time.time()
 
     def is_video_file(self, filepath):
         return filepath.suffix.lower() in self.VIDEO_EXTENSIONS
@@ -169,6 +177,42 @@ class VideoConverter:
                 cutoff = now - 300
                 self.recent_events = {k: v for k, v in self.recent_events.items() if v > cutoff}
             return True
+
+    def _can_attempt_file(self, filepath_str):
+        with self.failure_lock:
+            state = self.failure_retry_state.get(filepath_str)
+            if not state:
+                return True, 0, ''
+            failures = int(state.get('failures', 0))
+            if failures >= self.MAX_FAILURE_RETRIES:
+                return False, 0, f'已失败 {self.MAX_FAILURE_RETRIES} 次，停止自动重试'
+            next_retry_at = float(state.get('next_retry_at', 0))
+            now = self._now()
+            if next_retry_at > now:
+                remaining = int(next_retry_at - now)
+                return False, remaining, f'等待重试冷却，剩余约 {remaining} 秒'
+            return True, 0, ''
+
+    def _record_failure_for_retry(self, filepath_str):
+        with self.failure_lock:
+            state = self.failure_retry_state.get(filepath_str, {'failures': 0, 'next_retry_at': 0})
+            failures = int(state.get('failures', 0)) + 1
+            state['failures'] = failures
+            if failures >= self.MAX_FAILURE_RETRIES:
+                state['next_retry_at'] = 0
+                self.failure_retry_state[filepath_str] = state
+                print(f"转码失败已达到 {self.MAX_FAILURE_RETRIES} 次，停止自动重试: {filepath_str}")
+                return None
+            delay = self.FAILURE_RETRY_DELAYS[min(failures - 1, len(self.FAILURE_RETRY_DELAYS) - 1)]
+            next_retry_at = self._now() + delay
+            state['next_retry_at'] = next_retry_at
+            self.failure_retry_state[filepath_str] = state
+            print(f"转码失败，将在约 {delay} 秒后自动重试({failures}/{self.MAX_FAILURE_RETRIES}): {filepath_str}")
+            return next_retry_at
+
+    def _clear_failure_retry(self, filepath_str):
+        with self.failure_lock:
+            self.failure_retry_state.pop(filepath_str, None)
 
     def get_file_size(self, filepath):
         try:
@@ -230,6 +274,14 @@ class VideoConverter:
             width = video_stream.get('width', 0)
             height = video_stream.get('height', 0)
             codec = video_stream.get('codec_name', '')
+            duration = 0.0
+            for duration_raw in (video_stream.get('duration'), info.get('format', {}).get('duration')):
+                try:
+                    duration = float(duration_raw)
+                    if duration > 0:
+                        break
+                except (TypeError, ValueError):
+                    pass
             
             bit_rate_str = video_stream.get('bit_rate')
             if not bit_rate_str:
@@ -244,7 +296,7 @@ class VideoConverter:
             if log_file and log_file.exists():
                 try: log_file.unlink()
                 except Exception: pass
-            return {'width': width, 'height': height, 'codec': codec, 'bit_rate': bit_rate}
+            return {'width': width, 'height': height, 'codec': codec, 'bit_rate': bit_rate, 'duration': duration}
         except subprocess.TimeoutExpired:
             print(f"ffprobe 超时: {filepath}")
             if log_file and log_file.exists():
@@ -284,6 +336,10 @@ class VideoConverter:
             return
         
         filepath_str = str(filepath)
+        allowed, remaining, reason = self._can_attempt_file(filepath_str)
+        if not allowed:
+            print(f"跳过暂不可重试文件: {filepath_str}，{reason}")
+            return
         if not self._deduplicate_event(filepath_str):
             return
         
@@ -319,10 +375,15 @@ class VideoConverter:
             queued_at = item.get('queued_at', time.time())
             
             wait_start = time.time()
+            last_wait_log = 0
             while time.time() - wait_start < self.TRANSCODE_DELAY:
                 if not os.path.exists(filepath_str):
                     print(f"文件在等待期间被删除，跳过: {filepath_str}")
                     break
+                remaining = int(self.TRANSCODE_DELAY - (time.time() - wait_start))
+                if last_wait_log == 0 or time.time() - last_wait_log >= 30 or remaining <= 5:
+                    print(f"文件已入队，等待文件稳定: {filepath_str}，剩余约 {max(0, remaining)} 秒")
+                    last_wait_log = time.time()
                 time.sleep(5)
             
             if not os.path.exists(filepath_str):
@@ -347,10 +408,15 @@ class VideoConverter:
             
             try:
                 print(f"[SERIAL] 开始处理: {filepath_str}")
-                self.convert_video(filepath)
+                success, _ = self.convert_video(filepath)
+                if success:
+                    self._clear_failure_retry(filepath_str)
+                else:
+                    self._record_failure_for_retry(filepath_str)
             except Exception as e:
                 print(f"转码异常: {e}")
                 traceback.print_exc()
+                self._record_failure_for_retry(filepath_str)
             
             time.sleep(2)
 
@@ -395,16 +461,20 @@ class VideoConverter:
         safe_stem = safe_stem[:60].rstrip('._-') or 'video'
         return f"{safe_stem}_{digest}"
 
-    def _build_ffmpeg_cmd(self, input_path, output_path, target_codec, target_width, target_height, needs_resize):
+    def _build_ffmpeg_cmd(self, input_path, output_path, target_codec, target_width, target_height, needs_resize,
+                          preset_override=None, progress=False):
         is_qsv = target_codec.endswith('_qsv')
-        cmd = ['ffmpeg', '-hide_banner', '-nostats', '-i', str(input_path)]
+        cmd = ['ffmpeg', '-hide_banner', '-nostats']
+        if progress:
+            cmd.extend(['-progress', 'pipe:1'])
+        cmd.extend(['-i', str(input_path)])
         cmd.extend(['-c:v', target_codec])
 
         if is_qsv:
             cmd.extend(['-preset', 'medium'])
             cmd.extend(['-global_quality', str(self.target_quality)])
         else:
-            cmd.extend(['-preset', self.preset])
+            cmd.extend(['-preset', preset_override or self.preset])
             cmd.extend(['-crf', str(self.target_quality)])
             cmd.extend(['-maxrate', f'{self.MAX_BITRATE}'])
             cmd.extend(['-bufsize', f'{self.MAX_BITRATE * 2}'])
@@ -426,10 +496,42 @@ class VideoConverter:
             return 'libx265'
         return None
 
-    def _run_ffmpeg_cmd(self, cmd, ffmpeg_log):
+    def _run_ffmpeg_cmd(self, cmd, ffmpeg_log, duration_seconds=0, source_path=''):
         with open(ffmpeg_log, 'w') as log_file:
             print(f"ffmpeg 日志: {ffmpeg_log}")
-            return subprocess.run(cmd, stdout=log_file, stderr=subprocess.STDOUT, timeout=3600)
+            if not duration_seconds:
+                return subprocess.run(cmd, stdout=log_file, stderr=subprocess.STDOUT, timeout=3600)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, errors='replace', bufsize=1)
+            last_progress_log = 0
+            try:
+                for line in proc.stdout:
+                    log_file.write(line)
+                    log_file.flush()
+                    clean = line.strip()
+                    if not clean.startswith('out_time_ms='):
+                        continue
+                    try:
+                        out_ms = int(clean.split('=', 1)[1])
+                    except ValueError:
+                        continue
+                    percent = max(0.0, min(99.9, out_ms / 1000000 / duration_seconds * 100))
+                    now = time.time()
+                    if now - last_progress_log >= 5 or percent >= 99:
+                        print(f"转码进度: {percent:.1f}% | 当前文件: {source_path}")
+                        last_progress_log = now
+                try:
+                    returncode = proc.wait(timeout=3600)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    raise
+                return subprocess.CompletedProcess(cmd, returncode)
+            finally:
+                try:
+                    if proc.stdout:
+                        proc.stdout.close()
+                except Exception:
+                    pass
 
     def convert_video(self, input_path):
         try:
@@ -489,13 +591,15 @@ class VideoConverter:
             self.db.add_processed_file(input_path, original_size, True, 0)
             return True, 0
         
-        # 尊重用户选择的编码器，GPU加速仅在用户选择HEVC时生效
-        if self.use_gpu and self.codec in ('libx265', 'hevc_qsv'):
+        # 尊重用户选择的编码器；如果本进程已检测到 QSV 不可用，则直接走 CPU，避免每个文件都先失败一次。
+        if self.use_gpu and not self._qsv_disabled and self.codec in ('libx265', 'hevc_qsv'):
             target_codec = 'hevc_qsv'
-        elif self.use_gpu and self.codec == 'libx264':
+        elif self.use_gpu and not self._qsv_disabled and self.codec == 'libx264':
             target_codec = 'h264_qsv'
         else:
             target_codec = self.codec
+        if self._qsv_disabled and self.use_gpu:
+            print("QSV 已在本次运行中被判定不可用，直接使用 CPU 编码器")
         
         target_width, target_height = width, height
         needs_resize = False
@@ -520,7 +624,9 @@ class VideoConverter:
             import tempfile
             output_path = Path(tempfile.gettempdir()) / f"fpkc_{safe_stem}_tmp_{unique_id}.{self.container}"
         
-        cmd = self._build_ffmpeg_cmd(input_path, output_path, target_codec, target_width, target_height, needs_resize)
+        duration_seconds = float(video_info.get('duration') or 0)
+        cmd = self._build_ffmpeg_cmd(input_path, output_path, target_codec, target_width, target_height, needs_resize,
+                                     progress=duration_seconds > 0)
 
         print(f"ffmpeg 命令: {' '.join(cmd)}")
 
@@ -529,7 +635,7 @@ class VideoConverter:
         log_dir.mkdir(parents=True, exist_ok=True)
         ffmpeg_log = log_dir / f"ffmpeg_{unique_id}.log"
         try:
-            result = self._run_ffmpeg_cmd(cmd, ffmpeg_log)
+            result = self._run_ffmpeg_cmd(cmd, ffmpeg_log, duration_seconds, str(input_path))
 
             if result.returncode != 0:
                 err_msg = 'Unknown error'
@@ -539,13 +645,15 @@ class VideoConverter:
                 print(f"FFmpeg 错误 (返回码 {result.returncode}): {err_msg}")
                 fallback_codec = self._cpu_fallback_codec(target_codec)
                 if fallback_codec:
+                    self._qsv_disabled = True
                     if output_path.exists():
                         try: output_path.unlink()
                         except: pass
-                    fallback_cmd = self._build_ffmpeg_cmd(input_path, output_path, fallback_codec, target_width, target_height, needs_resize)
+                    fallback_cmd = self._build_ffmpeg_cmd(input_path, output_path, fallback_codec, target_width, target_height, needs_resize,
+                                                          preset_override='medium', progress=duration_seconds > 0)
                     print(f"QSV 转码失败，自动降级 CPU 编码器重试: {fallback_codec}")
                     print(f"ffmpeg 降级命令: {' '.join(fallback_cmd)}")
-                    result = self._run_ffmpeg_cmd(fallback_cmd, ffmpeg_log)
+                    result = self._run_ffmpeg_cmd(fallback_cmd, ffmpeg_log, duration_seconds, str(input_path))
                     if result.returncode == 0:
                         cmd = fallback_cmd
                     else:

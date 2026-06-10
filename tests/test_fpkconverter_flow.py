@@ -413,6 +413,54 @@ class WebServerFlowTests(unittest.TestCase):
         self.assertIn("recent_log", data)
         self.assertIn("FFmpeg 错误", "\n".join(data["recent_log"]))
 
+    def test_status_endpoint_shows_stable_waiting_activity(self):
+        self.client.post("/api/config", json={"monitor_dir": str(self.monitor_dir)})
+        fake_proc = FakeProc()
+
+        def fake_popen(*args, **kwargs):
+            return fake_proc
+
+        self.web.subprocess.Popen = fake_popen
+        self.client.post("/api/start")
+        Path(self.web.CONV_LOG).write_text(
+            "\n".join([
+                "=== 转码进程启动 ===",
+                "文件已入队，等待文件稳定: /media/a.mp4，剩余约 300 秒",
+            ]),
+            encoding="utf-8",
+        )
+
+        response = self.client.get("/api/status")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["process"]["current_file"], "/media/a.mp4")
+        self.assertIn("等待文件稳定", data["process"]["current_activity"])
+
+    def test_status_endpoint_parses_current_file_progress(self):
+        self.client.post("/api/config", json={"monitor_dir": str(self.monitor_dir)})
+        fake_proc = FakeProc()
+
+        def fake_popen(*args, **kwargs):
+            return fake_proc
+
+        self.web.subprocess.Popen = fake_popen
+        self.client.post("/api/start")
+        Path(self.web.CONV_LOG).write_text(
+            "\n".join([
+                "[SERIAL] 开始处理: /media/a.mp4",
+                "转码进度: 42.5% | 当前文件: /media/a.mp4",
+            ]),
+            encoding="utf-8",
+        )
+
+        response = self.client.get("/api/status")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["process"]["current_file"], "/media/a.mp4")
+        self.assertAlmostEqual(data["process"]["progress_percent"], 42.5)
+
 
 class ConverterLogicTests(unittest.TestCase):
     def setUp(self):
@@ -497,6 +545,46 @@ class ConverterLogicTests(unittest.TestCase):
         self.assertIn("-threads", cmd)
         self.assertEqual(cmd[cmd.index("-threads") + 1], "4")
 
+    def test_transcode_stable_wait_is_300_seconds(self):
+        self.assertEqual(self.converter_module.VideoConverter.TRANSCODE_DELAY, 300)
+
+    def test_failed_file_retry_uses_cooldown_before_next_attempt(self):
+        vc = self.converter_module.VideoConverter(self.db)
+        now = [1000]
+        vc._now = lambda: now[0]
+
+        next_retry_at = vc._record_failure_for_retry(str(self.video))
+        allowed, remaining, reason = vc._can_attempt_file(str(self.video))
+
+        self.assertEqual(next_retry_at, 1000 + 1800)
+        self.assertFalse(allowed)
+        self.assertEqual(remaining, 1800)
+        self.assertIn("等待重试冷却", reason)
+
+        now[0] = next_retry_at + 1
+        allowed, remaining, reason = vc._can_attempt_file(str(self.video))
+
+        self.assertTrue(allowed)
+        self.assertEqual(remaining, 0)
+        self.assertEqual(reason, "")
+
+    def test_failed_file_stops_after_three_retry_failures(self):
+        vc = self.converter_module.VideoConverter(self.db)
+        now = [1000]
+        vc._now = lambda: now[0]
+
+        next_retry_at = vc._record_failure_for_retry(str(self.video))
+        now[0] = next_retry_at + 1
+        next_retry_at = vc._record_failure_for_retry(str(self.video))
+        now[0] = next_retry_at + 1
+        stopped = vc._record_failure_for_retry(str(self.video))
+        allowed, remaining, reason = vc._can_attempt_file(str(self.video))
+
+        self.assertIsNone(stopped)
+        self.assertFalse(allowed)
+        self.assertEqual(remaining, 0)
+        self.assertIn("已失败 3 次", reason)
+
     def test_qsv_failure_falls_back_to_cpu_encoder_once(self):
         vc = self.converter_module.VideoConverter(
             self.db,
@@ -530,6 +618,40 @@ class ConverterLogicTests(unittest.TestCase):
         self.assertEqual(len(ffmpeg_cmds), 2)
         self.assertIn("h264_qsv", ffmpeg_cmds[0])
         self.assertIn("libx264", ffmpeg_cmds[1])
+
+    def test_qsv_fallback_uses_medium_cpu_preset_instead_of_slow(self):
+        vc = self.converter_module.VideoConverter(
+            self.db,
+            target_quality=23,
+            codec="libx265",
+            container="mp4",
+            preset="slow",
+            use_gpu=True,
+            temp_dir=str(self.work),
+        )
+        vc.get_video_info = lambda path: {"width": 1920, "height": 1080, "codec": "h264", "bit_rate": 8_000_000}
+        ffmpeg_cmds = []
+
+        def fake_run(cmd, stdout=None, stderr=None, timeout=None, **kwargs):
+            if cmd[:2] == ["ffmpeg", "-version"]:
+                return subprocess.CompletedProcess(cmd, 0)
+            if cmd and cmd[0] == "ffmpeg" and "-i" in cmd:
+                ffmpeg_cmds.append(cmd)
+                if "hevc_qsv" in cmd:
+                    return subprocess.CompletedProcess(cmd, 187)
+                output_path = Path(cmd[-1])
+                output_path.write_bytes(b"x" * 1000)
+                return subprocess.CompletedProcess(cmd, 0)
+            return subprocess.CompletedProcess(cmd, 0)
+
+        self.converter_module.subprocess.run = fake_run
+
+        success, _ = vc.convert_video(self.video)
+
+        self.assertTrue(success)
+        fallback_cmd = ffmpeg_cmds[1]
+        self.assertIn("libx265", fallback_cmd)
+        self.assertEqual(fallback_cmd[fallback_cmd.index("-preset") + 1], "medium")
 
     def test_temp_output_filename_is_short_and_safe(self):
         weird_video = self.work / ("A" * 120 + " @[] 中文 spaces.mp4")
