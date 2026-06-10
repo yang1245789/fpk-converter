@@ -46,6 +46,17 @@ CONTAINERS = ('mp4','mkv')
 PRESETS = ('ultrafast','superfast','veryfast','faster','fast','medium','slow','slower','veryslow')
 DEFAULT = {'monitor_dir':'','crf':23,'codec':'libx264','container':'mp4',
            'preset':'medium','threads':1,'use_gpu':True,'enabled':False}
+MIN_CRF = 18
+MAX_CRF = 32
+MAX_THREADS = 4
+BLOCKED_PATH_PREFIXES = (
+    '/bin', '/boot', '/dev', '/etc', '/lib', '/lib64', '/proc', '/root',
+    '/run', '/sbin', '/sys', '/usr', '/var'
+)
+ROOT_BROWSE_CANDIDATES = (
+    '/vol1', '/vol2', '/vol3', '/volume1', '/volume2', '/volume3',
+    '/mnt', '/media', '/home', '/share', '/shares', '/tmp'
+)
 cfg = dict(DEFAULT)
 proc = None
 conv_log_file = None
@@ -83,6 +94,39 @@ def init_db():
         print(f"init_db error: {e}")
 
 load_cfg(); init_db()
+
+def _normalize_abs_path(path):
+    try:
+        value = str(path or '').strip()
+        if not value or len(value) > 240:
+            return None, '路径为空或过长'
+        if not value.startswith('/'):
+            return None, '路径必须是绝对路径'
+        normalized = os.path.normpath(value)
+        if normalized != value or '..' in normalized.split(os.sep):
+            return None, '路径包含不安全的跳转'
+        return normalized, ''
+    except Exception:
+        return None, '路径格式无效'
+
+def _is_blocked_system_path(path):
+    normalized, _ = _normalize_abs_path(path)
+    if not normalized:
+        return True
+    if normalized == '/':
+        return True
+    return any(normalized == prefix or normalized.startswith(prefix + os.sep)
+               for prefix in BLOCKED_PATH_PREFIXES)
+
+def _validate_user_directory(path, must_exist=False):
+    normalized, err = _normalize_abs_path(path)
+    if not normalized:
+        return None, err
+    if _is_blocked_system_path(normalized):
+        return None, f'禁止选择系统目录: {normalized}'
+    if must_exist and not os.path.isdir(normalized):
+        return None, f'目录不存在: {normalized}'
+    return normalized, ''
 
 def _is_running():
     global proc
@@ -166,17 +210,18 @@ def api_cfg():
         for k,v in d.items():
             if k not in ALLOWED: continue
             if k == 'monitor_dir':
-                vs = str(v)
-                if vs.startswith('/') and '..' not in vs and os.path.normpath(vs) == vs:
-                    cfg[k] = vs
+                vs, err = _validate_user_directory(v, must_exist=False)
+                if not vs:
+                    return jsonify({'success':False, 'error':err}), 400
+                cfg[k] = vs
             elif k == 'crf':
-                try: cfg[k] = max(1, min(51, int(v)))
+                try: cfg[k] = max(MIN_CRF, min(MAX_CRF, int(v)))
                 except: pass
             elif k == 'codec' and v in CODECS: cfg[k] = v
             elif k == 'container' and v in CONTAINERS: cfg[k] = v
             elif k == 'preset' and v in PRESETS: cfg[k] = v
             elif k == 'threads':
-                try: cfg[k] = max(1, min(16, int(v)))
+                try: cfg[k] = max(1, min(MAX_THREADS, int(v)))
                 except: pass
             elif k == 'use_gpu': cfg[k] = bool(v)
         save_cfg()
@@ -201,11 +246,12 @@ def api_start():
     if _is_running():
         return jsonify({'success':False, 'error':'已在运行中'})
     md = cfg.get('monitor_dir','')
-    if not md or not md.startswith('/') or '..' in md or os.path.normpath(md) != md:
+    if not md:
         last_error = '请先选择监控文件夹'
         return jsonify({'success':False, 'error':last_error})
-    if not os.path.isdir(md):
-        last_error = f'目录不存在: {md}'
+    md, err = _validate_user_directory(md, must_exist=True)
+    if not md:
+        last_error = err
         return jsonify({'success':False, 'error':last_error})
     os.makedirs(TEMP_DIR, exist_ok=True)
     jp = os.path.join(VAR_DIR, 'start_config.json')
@@ -350,33 +396,22 @@ def api_logs():
 @app.route('/api/browse')
 def api_browse():
     p = request.args.get('path', '/')
-    if not p.startswith('/') or '..' in p or os.path.normpath(p) != p:
-        return jsonify({'error':'Invalid path'}), 400
+    normalized, err = _normalize_abs_path(p)
+    if not normalized:
+        return jsonify({'error':err}), 400
+    p = normalized
+    if p != '/' and _is_blocked_system_path(p):
+        return jsonify({'error':f'禁止浏览系统目录: {p}'}), 403
     # 限制路径深度，防止过深遍历
     if p.count('/') > 10:
         return jsonify({'error':'Path too deep'}), 400
     entries = []
     try:
         if p == '/':
-            # 动态扫描根目录，显示所有条目，权限不足标记为 no_access
-            try:
-                for item in sorted(os.listdir('/')):
-                    if len(entries) >= 50:
-                        break
-                    full = os.path.join('/', item)
-                    try:
-                        if os.path.isdir(full):
-                            entries.append({'name':item, 'path':full, 'is_dir':True})
-                        else:
-                            entries.append({'name':item, 'path':full, 'is_dir':False})
-                    except PermissionError:
-                        # 权限不足但条目存在，显示为可点击但无权限
-                        entries.append({'name':item, 'path':full, 'is_dir':True, 'no_access':True})
-                    except OSError:
-                        # 其他 OS 错误（如设备未就绪），跳过
-                        pass
-            except PermissionError:
-                return jsonify({'error':'无权限访问根目录'}), 403
+            # 根目录只暴露常见媒体/挂载入口，避免用户误选系统目录。
+            for full in ROOT_BROWSE_CANDIDATES:
+                if os.path.exists(full) and not _is_blocked_system_path(full):
+                    entries.append({'name':os.path.basename(full) or full, 'path':full, 'is_dir':os.path.isdir(full)})
         else:
             # 非根目录：先尝试 listdir，权限不足时尝试 isdir 回退
             try:
@@ -429,9 +464,9 @@ HTML = '''<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 </div>
 <div class="s"><div class="st">配置</div>
 <div class="fg"><label>监控文件夹</label><div style="display:flex;gap:8px"><input type="text" id="monitor_dir" value="{{config.monitor_dir}}" placeholder="点击浏览选择目录"><button class="btn bt1" style="padding:9px 14px;white-space:nowrap" onclick="openBrowser()">浏览</button></div></div>
-<div class="fg"><label>CRF (18-28, 越小质量越高)</label><input type="number" id="crf" min="18" max="28" value="{{config.crf}}"></div>
+<div class="fg"><label>CRF (18-32, 越小质量越高；已限制最低 18 防止过载)</label><input type="number" id="crf" min="18" max="32" value="{{config.crf}}"></div>
 <div class="fg"><label>编码预设 (越慢越省空间)</label><select id="preset">{% for p in ['ultrafast','superfast','veryfast','faster','fast','medium','slow','slower','veryslow'] %}<option value="{{p}}" {%if p==config.preset%}selected{%endif%}>{{p}}</option>{%endfor%}</select></div>
-<div class="fg"><label>线程数</label><input type="number" id="threads" min="1" max="8" value="{{config.threads}}"></div>
+<div class="fg"><label>线程数 (最多 4，保护系统负载)</label><input type="number" id="threads" min="1" max="4" value="{{config.threads}}"></div>
 <div class="fg"><label>编码器</label><select id="codec"><option value="libx264" {%if config.codec=="libx264"%}selected{%endif%}>H.264 (兼容性好)</option><option value="libx265" {%if config.codec=="libx265"%}selected{%endif%}>H.265 (更省空间)</option></select></div>
 <div class="fg"><label>格式</label><select id="container"><option value="mp4" {%if config.container=="mp4"%}selected{%endif%}>MP4</option><option value="mkv" {%if config.container=="mkv"%}selected{%endif%}>MKV</option></select></div>
 <div class="fg"><label><input type="checkbox" id="use_gpu" {%if config.use_gpu%}checked{%endif%}> GPU加速 (QSV)</label></div>
@@ -458,7 +493,7 @@ if __name__ == '__main__':
         global proc, conv_log_file
         if proc:
             try:
-                proc.terminate()
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                 proc.wait(timeout=5)
             except Exception:
                 try:

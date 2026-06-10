@@ -134,6 +134,30 @@ class WebServerFlowTests(unittest.TestCase):
         saved = json.loads(config_file.read_text())
         self.assertEqual(saved["container"], "mkv")
 
+    def test_save_config_rejects_system_directories(self):
+        response = self.client.post("/api/config", json={"monitor_dir": "/etc"})
+
+        self.assertEqual(response.status_code, 400)
+        data = response.get_json()
+        self.assertFalse(data["success"])
+        self.assertIn("系统目录", data["error"])
+        self.assertEqual(self.web.cfg["monitor_dir"], "")
+
+    def test_save_config_clamps_resource_intensive_values(self):
+        payload = {
+            "monitor_dir": str(self.monitor_dir),
+            "crf": 1,
+            "threads": 99,
+        }
+
+        response = self.client.post("/api/config", json=payload)
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data["success"])
+        self.assertEqual(data["config"]["crf"], 18)
+        self.assertEqual(data["config"]["threads"], 4)
+
     def test_browse_and_select_directory_flow_returns_entries(self):
         child = self.monitor_dir / "child"
         child.mkdir()
@@ -147,6 +171,21 @@ class WebServerFlowTests(unittest.TestCase):
         names = {entry["name"]: entry for entry in data["entries"]}
         self.assertTrue(names["child"]["is_dir"])
         self.assertFalse(names["sample.mp4"]["is_dir"])
+
+    def test_browse_rejects_system_directories(self):
+        response = self.client.get("/api/browse", query_string={"path": "/proc"})
+
+        self.assertEqual(response.status_code, 403)
+        data = response.get_json()
+        self.assertIn("系统目录", data["error"])
+
+    def test_root_browse_only_returns_safe_entry_points(self):
+        response = self.client.get("/api/browse", query_string={"path": "/"})
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        for entry in data["entries"]:
+            self.assertNotIn(entry["path"], {"/proc", "/sys", "/dev", "/etc", "/usr", "/var", "/run"})
 
     def test_start_stop_buttons_create_runtime_files_and_update_status(self):
         self.client.post("/api/config", json={"monitor_dir": str(self.monitor_dir)})
@@ -242,6 +281,16 @@ class WebServerFlowTests(unittest.TestCase):
         data = response.get_json()
         self.assertFalse(data["success"])
         self.assertIn("监控文件夹", data["error"])
+
+    def test_start_button_rejects_system_directory_even_if_config_is_tampered(self):
+        self.web.cfg["monitor_dir"] = "/etc"
+
+        response = self.client.post("/api/start")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertFalse(data["success"])
+        self.assertIn("系统目录", data["error"])
 
     def test_logs_endpoint_returns_database_rows_and_total_saved(self):
         conn = sqlite3.connect(self.web.DB_PATH)
@@ -359,6 +408,25 @@ class ConverterLogicTests(unittest.TestCase):
         ffmpeg_cmd = next(cmd for cmd in captured_cmds if cmd and cmd[0] == "ffmpeg" and "-i" in cmd)
         self.assertNotIn("+faststart", ffmpeg_cmd)
 
+    def test_ffmpeg_command_limits_threads(self):
+        vc = self.converter_module.VideoConverter(
+            self.db,
+            target_quality=1,
+            codec="libx264",
+            container="mp4",
+            preset="medium",
+            threads=99,
+            use_gpu=False,
+            temp_dir=str(self.work),
+        )
+
+        cmd = vc._build_ffmpeg_cmd(self.video, self.work / "out.mp4", "libx264", 1920, 1080, False)
+
+        self.assertEqual(vc.target_quality, 18)
+        self.assertEqual(vc.threads, 4)
+        self.assertIn("-threads", cmd)
+        self.assertEqual(cmd[cmd.index("-threads") + 1], "4")
+
     def test_qsv_failure_falls_back_to_cpu_encoder_once(self):
         vc = self.converter_module.VideoConverter(
             self.db,
@@ -435,6 +503,13 @@ class PackageEntryPointTests(unittest.TestCase):
         content = cmd_main.read_text()
 
         self.assertTrue("PYTHONUNBUFFERED=1" in content or " -u web_server.py" in content)
+
+    def test_web_server_signal_handler_cleans_process_group(self):
+        content = (APP_DIR / "web_server.py").read_text()
+        signal_block = content.split("def _sigterm", 1)[1]
+
+        self.assertIn("os.killpg", signal_block)
+        self.assertIn("SIGTERM", signal_block)
 
 
 if __name__ == "__main__":

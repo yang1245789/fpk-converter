@@ -118,15 +118,18 @@ class VideoConverter:
     SKIP_BITRATE = 5000 * 1000  # 5000 kbps = 5 Mbps - HEVC 1080p 低于此码率跳过
     TRANSCODE_DELAY = 900  # 15 分钟
     TEMP_MAX_GB = 30
+    MIN_CRF = 18
+    MAX_CRF = 32
+    MAX_THREADS = 4
 
     def __init__(self, db, target_quality=23, codec='libx264', container='mp4',
                  preset='medium', threads=1, use_gpu=True, temp_dir=''):
         self.db = db
-        self.target_quality = max(1, min(51, int(target_quality)))
+        self.target_quality = max(self.MIN_CRF, min(self.MAX_CRF, int(target_quality)))
         self.codec = codec if codec in self.ALLOWED_CODECS else 'libx265'
         self.container = container if container in self.ALLOWED_CONTAINERS else 'mp4'
         self.preset = preset if preset in self.ALLOWED_PRESETS else 'medium'
-        self.threads = max(1, min(16, int(threads)))
+        self.threads = max(1, min(self.MAX_THREADS, int(threads)))
         self.use_gpu = bool(use_gpu)
         self.temp_dir = Path(temp_dir) if temp_dir and str(temp_dir).strip() else None
         if self.temp_dir and not self.temp_dir.exists():
@@ -405,6 +408,7 @@ class VideoConverter:
             cmd.extend(['-crf', str(self.target_quality)])
             cmd.extend(['-maxrate', f'{self.MAX_BITRATE}'])
             cmd.extend(['-bufsize', f'{self.MAX_BITRATE * 2}'])
+        cmd.extend(['-threads', str(self.threads)])
 
         if needs_resize:
             cmd.extend(['-vf', f'scale={target_width}:{target_height}'])
