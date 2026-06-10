@@ -703,6 +703,75 @@ class ConverterLogicTests(unittest.TestCase):
         self.assertIn("/dev/dri", message)
         self.assertIn("QSV", message)
 
+    def test_qsv_command_explicitly_selects_render_device(self):
+        vc = self.converter_module.VideoConverter(self.db, use_gpu=True, temp_dir=str(self.work))
+
+        cmd = vc._build_ffmpeg_cmd(
+            self.video,
+            self.work / "out.mp4",
+            "hevc_qsv",
+            1920,
+            1080,
+            False,
+            qsv_device="/dev/dri/renderD128",
+        )
+
+        self.assertIn("-qsv_device", cmd)
+        self.assertEqual(cmd[cmd.index("-qsv_device") + 1], "/dev/dri/renderD128")
+        self.assertLess(cmd.index("-qsv_device"), cmd.index("-i"))
+
+    def test_qsv_environment_uses_fnnas_mediasrv_vaapi_stack(self):
+        vc = self.converter_module.VideoConverter(self.db, use_gpu=True, temp_dir=str(self.work))
+        original_exists = self.converter_module.os.path.exists
+
+        def fake_exists(path):
+            if path in {"/usr/trim/lib/mediasrv", "/usr/trim/lib/mediasrv/dri"}:
+                return True
+            return original_exists(path)
+
+        self.converter_module.os.path.exists = fake_exists
+        try:
+            env = vc._ffmpeg_env()
+        finally:
+            self.converter_module.os.path.exists = original_exists
+
+        self.assertEqual(env["LIBVA_DRIVER_NAME"], "iHD")
+        self.assertEqual(env["LIBVA_DRIVERS_PATH"], "/usr/trim/lib/mediasrv/dri")
+        self.assertIn("/usr/trim/lib/mediasrv", env["LD_LIBRARY_PATH"])
+
+    def test_gpu_conversion_tries_qsv_device_before_stopping(self):
+        vc = self.converter_module.VideoConverter(
+            self.db,
+            target_quality=23,
+            codec="libx265",
+            container="mp4",
+            preset="medium",
+            use_gpu=True,
+            temp_dir=str(self.work),
+        )
+        vc.get_video_info = lambda path: {"width": 1920, "height": 1080, "codec": "h264", "bit_rate": 8_000_000}
+        vc._render_devices = lambda: ["/dev/dri/renderD128"]
+        ffmpeg_cmds = []
+
+        def fake_run(cmd, stdout=None, stderr=None, timeout=None, env=None, **kwargs):
+            if "-version" in cmd:
+                return subprocess.CompletedProcess(cmd, 0)
+            if cmd and "-i" in cmd:
+                ffmpeg_cmds.append(cmd)
+                output_path = Path(cmd[-1])
+                output_path.write_bytes(b"x" * 1000)
+                return subprocess.CompletedProcess(cmd, 0)
+            return subprocess.CompletedProcess(cmd, 0)
+
+        self.converter_module.subprocess.run = fake_run
+
+        success, _ = vc.convert_video(self.video)
+
+        self.assertTrue(success)
+        self.assertEqual(len(ffmpeg_cmds), 1)
+        self.assertIn("-qsv_device", ffmpeg_cmds[0])
+        self.assertEqual(ffmpeg_cmds[0][ffmpeg_cmds[0].index("-qsv_device") + 1], "/dev/dri/renderD128")
+
     def test_temp_output_filename_is_short_and_safe(self):
         weird_video = self.work / ("A" * 120 + " @[] 中文 spaces.mp4")
         weird_video.write_bytes(b"x" * (11 * 1000 * 1000))

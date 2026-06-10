@@ -257,6 +257,54 @@ class VideoConverter:
             except Exception:
                 pass
 
+    def _mediasrv_path(self):
+        for path in ('/usr/trim/lib/mediasrv',):
+            if os.path.exists(path):
+                return path
+        return ''
+
+    def _ffmpeg_binary(self):
+        for path in (
+            '/usr/trim/lib/mediasrv/bin/ffmpeg',
+            '/usr/trim/lib/mediasrv/ffmpeg',
+            'ffmpeg',
+        ):
+            if path == 'ffmpeg' or os.path.exists(path):
+                return path
+        return 'ffmpeg'
+
+    def _ffprobe_binary(self):
+        for path in (
+            '/usr/trim/lib/mediasrv/bin/ffprobe',
+            '/usr/trim/lib/mediasrv/ffprobe',
+            'ffprobe',
+        ):
+            if path == 'ffprobe' or os.path.exists(path):
+                return path
+        return 'ffprobe'
+
+    def _ffmpeg_env(self):
+        env = os.environ.copy()
+        if self.use_gpu:
+            env['LIBVA_DRIVER_NAME'] = env.get('LIBVA_DRIVER_NAME') or 'iHD'
+            drivers_path = '/usr/trim/lib/mediasrv/dri'
+            mediasrv_path = self._mediasrv_path()
+            if os.path.exists(drivers_path):
+                env['LIBVA_DRIVERS_PATH'] = drivers_path
+            if mediasrv_path:
+                old_ld = env.get('LD_LIBRARY_PATH', '')
+                parts = [p for p in old_ld.split(':') if p]
+                if mediasrv_path not in parts:
+                    parts.insert(0, mediasrv_path)
+                env['LD_LIBRARY_PATH'] = ':'.join(parts)
+        return env
+
+    def _render_devices(self):
+        try:
+            return sorted(str(p) for p in Path('/dev/dri').glob('renderD*') if p.exists())
+        except Exception:
+            return []
+
     def get_file_size(self, filepath):
         try:
             return os.path.getsize(filepath)
@@ -270,7 +318,7 @@ class VideoConverter:
             return None
         
         cmd = [
-            'ffprobe', '-v', 'quiet',
+            self._ffprobe_binary(), '-v', 'quiet',
             '-print_format', 'json',
             '-show_format', '-show_streams',
             str(filepath)
@@ -281,9 +329,9 @@ class VideoConverter:
                 log_file = self.temp_dir / f"ffprobe_{os.getpid()}_{int(time.time())}.log"
             if log_file:
                 with open(log_file, 'w') as lf:
-                    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=lf, timeout=60)
+                    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=lf, timeout=60, env=self._ffmpeg_env())
             else:
-                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60)
+                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60, env=self._ffmpeg_env())
             
             if result.returncode != 0:
                 # 失败时也要清理 ffprobe 日志
@@ -506,9 +554,11 @@ class VideoConverter:
         return f"{safe_stem}_{digest}"
 
     def _build_ffmpeg_cmd(self, input_path, output_path, target_codec, target_width, target_height, needs_resize,
-                          preset_override=None, progress=False):
+                          preset_override=None, progress=False, qsv_device=None):
         is_qsv = target_codec.endswith('_qsv')
-        cmd = ['ffmpeg', '-hide_banner', '-nostats']
+        cmd = [self._ffmpeg_binary(), '-hide_banner', '-nostats']
+        if is_qsv and qsv_device:
+            cmd.extend(['-qsv_device', qsv_device])
         if progress:
             cmd.extend(['-progress', 'pipe:1'])
         cmd.extend(['-i', str(input_path)])
@@ -541,12 +591,13 @@ class VideoConverter:
         return None
 
     def _run_ffmpeg_cmd(self, cmd, ffmpeg_log, duration_seconds=0, source_path=''):
+        env = self._ffmpeg_env()
         with open(ffmpeg_log, 'w') as log_file:
             print(f"ffmpeg 日志: {ffmpeg_log}")
             if not duration_seconds:
-                return subprocess.run(cmd, stdout=log_file, stderr=subprocess.STDOUT, timeout=3600)
+                return subprocess.run(cmd, stdout=log_file, stderr=subprocess.STDOUT, timeout=3600, env=env)
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, errors='replace', bufsize=1)
+                                    text=True, errors='replace', bufsize=1, env=env)
             last_progress_log = 0
             try:
                 for line in proc.stdout:
@@ -657,6 +708,10 @@ class VideoConverter:
         
         if self.use_gpu:
             print(self._gpu_diagnostic_message())
+            env = self._ffmpeg_env()
+            print(f"QSV/GPU 环境: ffmpeg={self._ffmpeg_binary()}, "
+                  f"LIBVA_DRIVER_NAME={env.get('LIBVA_DRIVER_NAME', '')}, "
+                  f"LIBVA_DRIVERS_PATH={env.get('LIBVA_DRIVERS_PATH', '')}")
         print(f"开始转码: {input_path} (大小: {original_size / (1024*1024):.2f} MB)")
 
         unique_id = f"{os.getpid()}_{int(time.time())}"
@@ -669,17 +724,36 @@ class VideoConverter:
             output_path = Path(tempfile.gettempdir()) / f"fpkc_{safe_stem}_tmp_{unique_id}.{self.container}"
         
         duration_seconds = float(video_info.get('duration') or 0)
-        cmd = self._build_ffmpeg_cmd(input_path, output_path, target_codec, target_width, target_height, needs_resize,
-                                     progress=duration_seconds > 0)
-
-        print(f"ffmpeg 命令: {' '.join(cmd)}")
+        qsv_devices = self._render_devices() if (self.use_gpu and target_codec.endswith('_qsv')) else []
+        qsv_attempt_devices = qsv_devices or [None]
+        cmd = None
 
         # 始终创建 ffmpeg 日志文件，确保错误可追踪
         log_dir = self.temp_dir if (self.temp_dir and self.temp_dir.is_dir()) else Path(tempfile.gettempdir())
         log_dir.mkdir(parents=True, exist_ok=True)
         ffmpeg_log = log_dir / f"ffmpeg_{unique_id}.log"
         try:
-            result = self._run_ffmpeg_cmd(cmd, ffmpeg_log, duration_seconds, str(input_path))
+            result = None
+            for attempt_index, qsv_device in enumerate(qsv_attempt_devices, 1):
+                cmd = self._build_ffmpeg_cmd(input_path, output_path, target_codec, target_width, target_height, needs_resize,
+                                             progress=duration_seconds > 0, qsv_device=qsv_device)
+                if qsv_device:
+                    print(f"QSV 尝试 {attempt_index}/{len(qsv_attempt_devices)}: 使用设备 {qsv_device}")
+                print(f"ffmpeg 命令: {' '.join(cmd)}")
+                result = self._run_ffmpeg_cmd(cmd, ffmpeg_log, duration_seconds, str(input_path))
+                if result.returncode == 0:
+                    break
+                if self.use_gpu and target_codec.endswith('_qsv') and attempt_index < len(qsv_attempt_devices):
+                    err_msg = 'Unknown error'
+                    if ffmpeg_log.exists():
+                        try: err_msg = ffmpeg_log.read_text()[-1000:]
+                        except: pass
+                    print(f"QSV 设备 {qsv_device or '默认设备'} 转码失败，尝试下一个设备。错误摘要: {err_msg}")
+                    if output_path.exists():
+                        try: output_path.unlink()
+                        except: pass
+                    continue
+                break
 
             if result.returncode != 0:
                 err_msg = 'Unknown error'
