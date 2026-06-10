@@ -81,6 +81,10 @@ class WebServerFlowTests(unittest.TestCase):
         self.assertIn("id=\"monitor_dir\"", html)
         self.assertIn("id=\"codec\"", html)
         self.assertIn("id=\"container\"", html)
+        self.assertIn("id=\"process_pid\"", html)
+        self.assertIn("id=\"current_activity\"", html)
+        self.assertIn("id=\"last_error_text\"", html)
+        self.assertIn("id=\"recent_log\"", html)
 
     def test_save_config_button_endpoint_persists_valid_values(self):
         payload = {
@@ -237,6 +241,39 @@ class WebServerFlowTests(unittest.TestCase):
         data = response.get_json()
         self.assertEqual(data["total_saved_mb"], 5.0)
         self.assertEqual(data["logs"][0]["filepath"], "/tmp/a.mp4")
+
+    def test_status_endpoint_exposes_process_error_and_recent_transcode_output(self):
+        self.client.post("/api/config", json={"monitor_dir": str(self.monitor_dir)})
+        fake_proc = FakeProc()
+
+        def fake_popen(*args, **kwargs):
+            return fake_proc
+
+        self.web.subprocess.Popen = fake_popen
+        self.client.post("/api/start")
+        Path(self.web.CONV_LOG).write_text(
+            "\n".join([
+                "=== 转码进程启动 ===",
+                "[SERIAL] 开始处理: /media/a.mp4",
+                "视频信息: 1920x1080, 编码: h264, 码率: 8.00 Mbps",
+                "开始转码: /media/a.mp4 (大小: 100.00 MB)",
+                "FFmpeg 错误 (返回码 1): qsv init failed",
+            ]),
+            encoding="utf-8",
+        )
+
+        response = self.client.get("/api/status")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertIn("process", data)
+        self.assertEqual(data["process"]["pid"], fake_proc.pid)
+        self.assertTrue(data["process"]["running"])
+        self.assertEqual(data["process"]["current_file"], "/media/a.mp4")
+        self.assertIn("开始转码", data["process"]["current_activity"])
+        self.assertIn("qsv init failed", data["process"]["last_error"])
+        self.assertIn("recent_log", data)
+        self.assertIn("FFmpeg 错误", "\n".join(data["recent_log"]))
 
 
 class ConverterLogicTests(unittest.TestCase):

@@ -50,6 +50,7 @@ cfg = dict(DEFAULT)
 proc = None
 conv_log_file = None
 last_error = ''
+proc_started_at = None
 proc_lock = threading.Lock()
 
 def load_cfg():
@@ -92,6 +93,68 @@ def _is_running():
     except Exception:
         return False
 
+def _tail_lines(path, max_lines=80, max_bytes=65536):
+    try:
+        if not os.path.exists(path):
+            return []
+        size = os.path.getsize(path)
+        with open(path, 'rb') as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+            data = f.read().decode('utf-8', errors='replace')
+        return data.splitlines()[-max_lines:]
+    except Exception as e:
+        return [f'读取日志失败: {e}']
+
+def _parse_process_state(lines):
+    state = {'current_file':'', 'current_activity':'', 'last_error':''}
+    error_keywords = ('错误', '失败', '异常', '未找到', 'Traceback', 'PermissionError', 'Error')
+    activity_keywords = ('[SERIAL] 开始处理:', '开始转码:', '视频信息:', 'ffmpeg 命令:', 'QSV 转码失败', '转码完成:', '已替换原文件:')
+    for line in lines:
+        clean = line.strip()
+        if not clean:
+            continue
+        if '[SERIAL] 开始处理:' in clean:
+            state['current_file'] = clean.split('[SERIAL] 开始处理:', 1)[1].strip()
+            state['current_activity'] = clean
+            continue
+        if clean.startswith('开始转码:'):
+            rest = clean.split('开始转码:', 1)[1].strip()
+            state['current_file'] = rest.split(' (大小:', 1)[0].strip()
+            state['current_activity'] = clean
+            continue
+        if any(k in clean for k in error_keywords):
+            state['last_error'] = clean
+            continue
+        if any(k in clean for k in activity_keywords):
+            state['current_activity'] = clean
+    return state
+
+def _process_snapshot():
+    running = _is_running()
+    lines = _tail_lines(CONV_LOG)
+    parsed = _parse_process_state(lines)
+    pid = None
+    returncode = None
+    with proc_lock:
+        if proc is not None:
+            pid = getattr(proc, 'pid', None)
+            try:
+                returncode = proc.poll()
+            except Exception:
+                returncode = None
+    uptime = None
+    if proc_started_at and running:
+        uptime = max(0, int(time.time() - proc_started_at))
+    return {
+        'running': running,
+        'pid': pid,
+        'started_at': proc_started_at,
+        'uptime_seconds': uptime,
+        'returncode': returncode,
+        **parsed
+    }, lines
+
 @app.route('/')
 def index(): return render_template_string(HTML, config=cfg, var_dir=VAR_DIR, conv_log=CONV_LOG, db_path=DB_PATH)
 
@@ -123,13 +186,16 @@ def api_cfg():
 @app.route('/api/status')
 def api_status():
     global last_error
-    return jsonify({'running':_is_running(), 'config':cfg, 'error':last_error})
+    process, lines = _process_snapshot()
+    display_error = last_error or process.get('last_error', '')
+    return jsonify({'running':process['running'], 'config':cfg, 'error':display_error,
+                    'process':process, 'recent_log':lines})
 
 TEMP_DIR = os.path.join(VAR_DIR, 'temp')
 
 @app.route('/api/start', methods=['POST'])
 def api_start():
-    global proc, last_error, conv_log_file
+    global proc, last_error, conv_log_file, proc_started_at
     # 先在锁外做验证和文件准备
     last_error = ''
     if _is_running():
@@ -212,9 +278,10 @@ FolderScanner(c["monitor_dir"],vc,max_depth=c.get("max_depth",3)).start()
         env['PYTHONUNBUFFERED'] = '1'
         proc = subprocess.Popen([py, '-u', sc], cwd=VAR_DIR, start_new_session=True,
                                 stdout=conv_log_file, stderr=subprocess.STDOUT, env=env)
+        proc_started_at = int(time.time())
     # 非阻塞健康检查：3秒后验证
     def _health_check():
-        global proc, last_error, conv_log_file
+        global proc, last_error, conv_log_file, proc_started_at
         time.sleep(3)
         with proc_lock:
             if proc and not _is_running():
@@ -224,13 +291,14 @@ FolderScanner(c["monitor_dir"],vc,max_depth=c.get("max_depth",3)).start()
                     except: pass
                     conv_log_file = None
                 proc = None
+                proc_started_at = None
     threading.Thread(target=_health_check, daemon=True).start()
     cfg['enabled'] = True; save_cfg()
     return jsonify({'success':True})
 
 @app.route('/api/stop', methods=['POST'])
 def api_stop():
-    global proc, last_error, conv_log_file
+    global proc, last_error, conv_log_file, proc_started_at
     with proc_lock:
         last_error = ''
         if proc:
@@ -252,6 +320,7 @@ def api_stop():
             except Exception:
                 pass
             proc = None
+            proc_started_at = None
         if conv_log_file:
             try: conv_log_file.close()
             except: pass
@@ -342,12 +411,22 @@ def api_browse():
 HTML = '''<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>视频自动转码工具</title><style>
-*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;padding:20px}.c{max-width:1000px;margin:0 auto}.hd{background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;padding:28px 32px;border-radius:12px 12px 0 0}.hd h1{font-size:24px;margin-bottom:6px}.hd p{opacity:.85;font-size:14px}.ct{padding:24px 32px;background:#fff;border-radius:0 0 12px 12px;box-shadow:0 1px 3px rgba(0,0,0,.1)}.s{margin-bottom:28px}.st{font-size:16px;font-weight:600;margin-bottom:14px;color:#1f2937;display:flex;align-items:center;gap:8px}.badge{display:inline-block;padding:3px 12px;border-radius:20px;font-size:12px;font-weight:500}.bg{background:#d1fae5;color:#065f46}.br{background:#fee2e2;color:#991b1b}.bg2{display:flex;gap:10px;margin-top:12px}.btn{padding:10px 20px;border:none;border-radius:6px;font-size:14px;font-weight:500;cursor:pointer}.bt1{background:#4f46e5;color:#fff}.bt2{background:#10b981;color:#fff}.bt3{background:#ef4444;color:#fff}.fg{margin-bottom:14px}label{display:block;margin-bottom:5px;font-weight:500;color:#374151;font-size:13px}input,select{width:100%;padding:9px 12px;border:1px solid #d1d5db;border-radius:6px;font-size:14px;background:#f9fafb}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}.sc{background:#f3f4f6;padding:18px;border-radius:8px;text-align:center}.sv{font-size:28px;font-weight:700;color:#4f46e5}.sl{color:#6b7280;margin-top:4px;font-size:13px}.tc{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:10px 12px;text-align:left;border-bottom:1px solid #e5e7eb}th{background:#f9fafb;font-weight:600;color:#374151}.suc{color:#059669}.err{color:#dc2626}.errmsg{color:#dc2626;font-size:13px;margin-top:8px;padding:8px 12px;background:#fef2f2;border-radius:6px;display:none}.info{color:#6b7280;font-size:12px;margin-top:6px}</style></head><body><div class="c"><div class="hd">
+*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;padding:20px}.c{max-width:1000px;margin:0 auto}.hd{background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;padding:28px 32px;border-radius:12px 12px 0 0}.hd h1{font-size:24px;margin-bottom:6px}.hd p{opacity:.85;font-size:14px}.ct{padding:24px 32px;background:#fff;border-radius:0 0 12px 12px;box-shadow:0 1px 3px rgba(0,0,0,.1)}.s{margin-bottom:28px}.st{font-size:16px;font-weight:600;margin-bottom:14px;color:#1f2937;display:flex;align-items:center;gap:8px}.badge{display:inline-block;padding:3px 12px;border-radius:20px;font-size:12px;font-weight:500}.bg{background:#d1fae5;color:#065f46}.br{background:#fee2e2;color:#991b1b}.bg2{display:flex;gap:10px;margin-top:12px}.btn{padding:10px 20px;border:none;border-radius:6px;font-size:14px;font-weight:500;cursor:pointer}.bt1{background:#4f46e5;color:#fff}.bt2{background:#10b981;color:#fff}.bt3{background:#ef4444;color:#fff}.fg{margin-bottom:14px}label{display:block;margin-bottom:5px;font-weight:500;color:#374151;font-size:13px}input,select{width:100%;padding:9px 12px;border:1px solid #d1d5db;border-radius:6px;font-size:14px;background:#f9fafb}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}.sc{background:#f3f4f6;padding:18px;border-radius:8px;text-align:center}.sv{font-size:28px;font-weight:700;color:#4f46e5}.sl{color:#6b7280;margin-top:4px;font-size:13px}.tc{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:10px 12px;text-align:left;border-bottom:1px solid #e5e7eb}th{background:#f9fafb;font-weight:600;color:#374151}.suc{color:#059669}.err{color:#dc2626}.errmsg{color:#dc2626;font-size:13px;margin-top:8px;padding:8px 12px;background:#fef2f2;border-radius:6px;display:none}.info{color:#6b7280;font-size:12px;margin-top:6px}.process{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-top:12px}.kv{background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:10px}.kl{font-size:12px;color:#6b7280;margin-bottom:4px}.vv{font-size:13px;color:#111827;word-break:break-all}.logbox{background:#111827;color:#d1d5db;border-radius:8px;padding:12px;max-height:260px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;white-space:pre-wrap}.errbox{background:#fef2f2;color:#991b1b;border:1px solid #fecaca;border-radius:8px;padding:10px;font-size:13px;white-space:pre-wrap;word-break:break-word}</style></head><body><div class="c"><div class="hd">
 <h1>视频自动转码工具</h1><p>自动监测文件夹 | 智能转码 | 节省空间</p></div><div class="ct">
 <div class="s"><div class="st"><span>状态</span><span id="badge" class="badge br">已停止</span></div>
 <div id="errmsg" class="errmsg"></div>
 <div class="bg2"><button class="btn bt2" onclick="api('start')">启动</button>
 <button class="btn bt3" onclick="api('stop')">停止</button></div></div>
+<div class="s"><div class="st">转码进程</div>
+<div class="process">
+<div class="kv"><div class="kl">PID</div><div class="vv" id="process_pid">-</div></div>
+<div class="kv"><div class="kl">运行时长</div><div class="vv" id="process_uptime">-</div></div>
+<div class="kv"><div class="kl">当前文件</div><div class="vv" id="current_file">-</div></div>
+<div class="kv"><div class="kl">当前状态</div><div class="vv" id="current_activity">-</div></div>
+</div>
+<div style="margin-top:12px"><div class="kl">最近错误</div><div class="errbox" id="last_error_text">无</div></div>
+<div style="margin-top:12px"><div class="kl">最近转码输出</div><pre class="logbox" id="recent_log">暂无日志</pre></div>
+</div>
 <div class="s"><div class="st">配置</div>
 <div class="fg"><label>监控文件夹</label><div style="display:flex;gap:8px"><input type="text" id="monitor_dir" value="{{config.monitor_dir}}" placeholder="点击浏览选择目录"><button class="btn bt1" style="padding:9px 14px;white-space:nowrap" onclick="openBrowser()">浏览</button></div></div>
 <div class="fg"><label>CRF (18-28, 越小质量越高)</label><input type="number" id="crf" min="18" max="28" value="{{config.crf}}"></div>
@@ -364,7 +443,7 @@ HTML = '''<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <script>
 function api(a){fetch('/api/'+a,{method:'POST'}).then(r=>{if(!r.ok)throw new Error(r.status);return r.json()}).then(d=>{if(d.error){el('errmsg').textContent=d.error;el('errmsg').style.display='block'}else{el('errmsg').style.display='none'}refresh()}).catch(e=>{el('errmsg').textContent='请求失败: '+e.message;el('errmsg').style.display='block'})}
 function saveCfg(){let d={monitor_dir:el('monitor_dir').value,crf:parseInt(el('crf').value),preset:el('preset').value,threads:parseInt(el('threads').value),codec:el('codec').value,container:el('container').value,use_gpu:el('use_gpu').checked};fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>{if(!r.ok)throw new Error(r.status);return r.json()}).then(d=>{if(d.success)alert('已保存');else alert('保存失败')}).catch(e=>alert('保存失败: '+e.message))}
-async function refresh(){try{let s=await fetch('/api/status').then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});let b=el('badge');b.textContent=s.running?'运行中':'已停止';b.className='badge '+(s.running?'bg':'br');s.config&&(el('monitor_dir').value=s.config.monitor_dir,el('crf').value=s.config.crf,el('preset').value=s.config.preset,el('threads').value=s.config.threads,el('codec').value=s.config.codec,el('container').value=s.config.container,el('use_gpu').checked=s.config.use_gpu!==false);let l=await fetch('/api/logs').then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});el('ts').textContent=l.total_saved_mb;el('tc2').textContent=l.logs.length;let t=el('tb');t.innerHTML='';l.logs.forEach(r=>{let tr=document.createElement('tr');['filepath','file_size_mb','saved_size_mb'].forEach(k=>{let td=document.createElement('td');td.textContent=r[k];tr.appendChild(td)});let sd=document.createElement('td');sd.textContent=r.success?'成功':'失败';sd.className=r.success?'suc':'err';tr.appendChild(sd);let td=document.createElement('td');td.textContent=r.processed_at;tr.appendChild(td);t.appendChild(tr)})}catch(e){console.error('refresh error:',e)}}
+async function refresh(){try{let s=await fetch('/api/status').then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});let b=el('badge');b.textContent=s.running?'运行中':'已停止';b.className='badge '+(s.running?'bg':'br');s.config&&(el('monitor_dir').value=s.config.monitor_dir,el('crf').value=s.config.crf,el('preset').value=s.config.preset,el('threads').value=s.config.threads,el('codec').value=s.config.codec,el('container').value=s.config.container,el('use_gpu').checked=s.config.use_gpu!==false);let p=s.process||{};el('process_pid').textContent=p.pid||'-';el('process_uptime').textContent=p.uptime_seconds!=null?(p.uptime_seconds+' 秒'):'-';el('current_file').textContent=p.current_file||'-';el('current_activity').textContent=p.current_activity||'-';el('last_error_text').textContent=s.error||p.last_error||'无';el('recent_log').textContent=(s.recent_log&&s.recent_log.length)?s.recent_log.join('\n'):'暂无日志';let l=await fetch('/api/logs').then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});el('ts').textContent=l.total_saved_mb;el('tc2').textContent=l.logs.length;let t=el('tb');t.innerHTML='';l.logs.forEach(r=>{let tr=document.createElement('tr');['filepath','file_size_mb','saved_size_mb'].forEach(k=>{let td=document.createElement('td');td.textContent=r[k];tr.appendChild(td)});let sd=document.createElement('td');sd.textContent=r.success?'成功':'失败';sd.className=r.success?'suc':'err';tr.appendChild(sd);let td=document.createElement('td');td.textContent=r.processed_at;tr.appendChild(td);t.appendChild(tr)})}catch(e){console.error('refresh error:',e)}}
 function el(id){return document.getElementById(id)}
 var browsePath='/';
 async function openBrowser(p){if(p)browsePath=p;try{let d=await fetch('/api/browse?path='+encodeURIComponent(browsePath)).then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});if(d.error){alert(d.error);return}let m=el('modal'),lst=el('blist');el('bpath').textContent=d.path;lst.innerHTML='';if(d.path!=='/'){let b=document.createElement('div');b.className='bitem';b.textContent='.. 返回上级';b.onclick=()=>openBrowser(d.path.split('/').slice(0,-1).join('/')||'/');lst.appendChild(b)}d.entries.forEach(e=>{let b=document.createElement('div');b.className='bitem';b.textContent=e.name+(e.is_dir?'/':'');if(e.no_access){b.style.opacity='0.4';b.title='无权限';if(e.is_dir)b.onclick=()=>alert('无权限访问此目录')}else if(e.is_dir){b.onclick=()=>openBrowser(e.path)}else{b.style.opacity='0.5'}lst.appendChild(b)});m.style.display='flex'}catch(e){alert('浏览目录失败: '+e.message)}}
