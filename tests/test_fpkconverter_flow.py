@@ -461,6 +461,29 @@ class WebServerFlowTests(unittest.TestCase):
         self.assertEqual(data["process"]["current_file"], "/media/a.mp4")
         self.assertAlmostEqual(data["process"]["progress_percent"], 42.5)
 
+    def test_start_rotates_large_converter_log_without_removing_state_files(self):
+        self.client.post("/api/config", json={"monitor_dir": str(self.monitor_dir)})
+        fake_proc = FakeProc()
+        self.web.LOG_MAX_BYTES = 64
+        self.web.LOG_BACKUP_COUNT = 2
+        Path(self.web.CONV_LOG).write_text("旧日志\n" * 40, encoding="utf-8")
+        Path(self.web.DB_PATH).write_text("db-data", encoding="utf-8")
+        Path(self.web.CONFIG_PATH).write_text("config-data", encoding="utf-8")
+
+        def fake_popen(*args, **kwargs):
+            return fake_proc
+
+        self.web.subprocess.Popen = fake_popen
+
+        response = self.client.post("/api/start")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["success"])
+        self.assertTrue(Path(self.web.CONV_LOG + ".1").exists())
+        self.assertEqual(Path(self.web.DB_PATH).read_text(encoding="utf-8"), "db-data")
+        saved_config = json.loads(Path(self.web.CONFIG_PATH).read_text(encoding="utf-8"))
+        self.assertEqual(saved_config["monitor_dir"], str(self.monitor_dir))
+
 
 class ConverterLogicTests(unittest.TestCase):
     def setUp(self):
@@ -651,6 +674,34 @@ class ConverterLogicTests(unittest.TestCase):
         self.assertEqual(len(ffmpeg_cmds), 1)
         self.assertIn("hevc_qsv", ffmpeg_cmds[0])
         self.assertFalse(any("libx265" in cmd for cmd in ffmpeg_cmds))
+
+    def test_temp_ffmpeg_logs_are_capped_without_touching_database(self):
+        vc = self.converter_module.VideoConverter(self.db, temp_dir=str(self.work))
+        for i in range(70):
+            p = self.work / f"ffmpeg_old_{i}.log"
+            p.write_text("log", encoding="utf-8")
+            os.utime(p, (1000 + i, 1000 + i))
+        db_file = self.work / "test.db"
+        before_db_size = db_file.stat().st_size
+
+        vc._cleanup_transcode_logs(max_keep=50, max_age_seconds=10**9)
+
+        logs = sorted(self.work.glob("ffmpeg_*.log"))
+        self.assertLessEqual(len(logs), 50)
+        self.assertTrue(db_file.exists())
+        self.assertEqual(db_file.stat().st_size, before_db_size)
+
+    def test_gpu_diagnostic_reports_missing_dri_device(self):
+        vc = self.converter_module.VideoConverter(self.db, use_gpu=True, temp_dir=str(self.work))
+        original_exists = self.converter_module.os.path.exists
+        self.converter_module.os.path.exists = lambda path: False if path == "/dev/dri" else original_exists(path)
+        try:
+            message = vc._gpu_diagnostic_message()
+        finally:
+            self.converter_module.os.path.exists = original_exists
+
+        self.assertIn("/dev/dri", message)
+        self.assertIn("QSV", message)
 
     def test_temp_output_filename_is_short_and_safe(self):
         weird_video = self.work / ("A" * 120 + " @[] 中文 spaces.mp4")

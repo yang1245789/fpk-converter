@@ -123,6 +123,8 @@ class VideoConverter:
     MAX_THREADS = 4
     FAILURE_RETRY_DELAYS = (1800, 7200, 21600)  # 30分钟、2小时、6小时
     MAX_FAILURE_RETRIES = 3
+    TEMP_LOG_MAX_KEEP = 50
+    TEMP_LOG_MAX_AGE_SECONDS = 7 * 24 * 3600
 
     def __init__(self, db, target_quality=23, codec='libx264', container='mp4',
                  preset='medium', threads=1, use_gpu=True, temp_dir=''):
@@ -213,6 +215,47 @@ class VideoConverter:
     def _clear_failure_retry(self, filepath_str):
         with self.failure_lock:
             self.failure_retry_state.pop(filepath_str, None)
+
+    def _gpu_diagnostic_message(self):
+        if not self.use_gpu:
+            return ''
+        if not os.path.exists('/dev/dri'):
+            return 'QSV/GPU 诊断: 未发现 /dev/dri，应用进程无法访问 Intel GPU 设备，无法进行 QSV 转码。'
+        try:
+            devices = sorted(str(p) for p in Path('/dev/dri').glob('renderD*'))
+        except Exception:
+            devices = []
+        if not devices:
+            return 'QSV/GPU 诊断: /dev/dri 下没有 renderD* 设备，ffmpeg 无法创建 VAAPI/QSV 设备。'
+        inaccessible = [p for p in devices if not os.access(p, os.R_OK | os.W_OK)]
+        if inaccessible:
+            return f"QSV/GPU 诊断: 当前应用用户无权读写 {', '.join(inaccessible)}，ffmpeg 会创建 VAAPI 设备失败。"
+        return f"QSV/GPU 诊断: 检测到可访问设备 {', '.join(devices)}，将尝试 QSV 转码。"
+
+    def _cleanup_transcode_logs(self, max_keep=None, max_age_seconds=None):
+        if not self.temp_dir or not self.temp_dir.is_dir():
+            return
+        max_keep = self.TEMP_LOG_MAX_KEEP if max_keep is None else max_keep
+        max_age_seconds = self.TEMP_LOG_MAX_AGE_SECONDS if max_age_seconds is None else max_age_seconds
+        now = self._now()
+        logs = []
+        for pattern in ('ffmpeg_*.log', 'ffprobe_*.log'):
+            logs.extend([p for p in self.temp_dir.glob(pattern) if p.is_file()])
+        kept = []
+        for p in logs:
+            try:
+                if now - p.stat().st_mtime > max_age_seconds:
+                    p.unlink()
+                else:
+                    kept.append(p)
+            except Exception:
+                pass
+        kept.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+        for p in kept[max_keep:]:
+            try:
+                p.unlink()
+            except Exception:
+                pass
 
     def get_file_size(self, filepath):
         try:
@@ -405,6 +448,7 @@ class VideoConverter:
                 pass
             
             self._enforce_temp_limit()
+            self._cleanup_transcode_logs()
             
             try:
                 print(f"[SERIAL] 开始处理: {filepath_str}")
@@ -611,6 +655,8 @@ class VideoConverter:
             needs_resize = True
             print(f"缩放分辨率: {width}x{height} -> {target_width}x{target_height}")
         
+        if self.use_gpu:
+            print(self._gpu_diagnostic_message())
         print(f"开始转码: {input_path} (大小: {original_size / (1024*1024):.2f} MB)")
 
         unique_id = f"{os.getpid()}_{int(time.time())}"

@@ -32,6 +32,8 @@ CONV_LOG    = os.path.join(VAR_DIR, 'converter.log')
 # 由 cmd/config_callback 把 TRIM_DATA_ACCESSIBLE_PATHS 写入此文件，
 # 让 web 进程在用户变更授权后无需重启即可感知。
 ACCESSIBLE_PATHS_FILE = os.path.join(VAR_DIR, 'accessible_paths')
+LOG_MAX_BYTES = 2 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
 
 import subprocess, sqlite3, time, json, threading
 from flask import Flask, render_template_string, request, jsonify
@@ -67,6 +69,30 @@ conv_log_file = None
 last_error = ''
 proc_started_at = None
 proc_lock = threading.Lock()
+
+def _rotate_log_if_needed(path, max_bytes=None, backup_count=None):
+    max_bytes = LOG_MAX_BYTES if max_bytes is None else max_bytes
+    backup_count = LOG_BACKUP_COUNT if backup_count is None else backup_count
+    try:
+        if not path or not os.path.exists(path) or os.path.getsize(path) <= max_bytes:
+            return False
+        for idx in range(backup_count, 0, -1):
+            src = f'{path}.{idx}'
+            dst = f'{path}.{idx + 1}'
+            if os.path.exists(src):
+                if idx >= backup_count:
+                    os.remove(src)
+                else:
+                    os.replace(src, dst)
+        os.replace(path, f'{path}.1')
+        return True
+    except Exception as e:
+        try:
+            with open(path, 'a') as f:
+                f.write(f'\n日志轮转失败: {e}\n')
+        except Exception:
+            pass
+        return False
 
 def load_cfg():
     global cfg
@@ -395,6 +421,7 @@ FolderScanner(c["monitor_dir"],vc,max_depth=c.get("max_depth",3)).start()
             try: conv_log_file.close()
             except: pass
             conv_log_file = None
+        _rotate_log_if_needed(CONV_LOG)
         conv_log_file = open(CONV_LOG, 'a')
         # fnOS 中 sys.executable 可能为空，回退到 python3；使用无缓冲模式确保日志实时写入
         py = sys.executable if sys.executable else 'python3'
