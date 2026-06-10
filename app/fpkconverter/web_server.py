@@ -223,6 +223,45 @@ def _is_running():
     except Exception:
         return False
 
+def _kill_stale_converter_processes():
+    """清理 web 进程重启后遗留的旧转码子进程，避免旧版本继续写日志。"""
+    killed = []
+    proc_root = '/proc'
+    try:
+        current_pid = os.getpid()
+        for name in os.listdir(proc_root):
+            if not name.isdigit():
+                continue
+            pid = int(name)
+            if pid == current_pid:
+                continue
+            cmdline_path = os.path.join(proc_root, name, 'cmdline')
+            try:
+                with open(cmdline_path, 'rb') as f:
+                    raw = f.read()
+                if not raw:
+                    continue
+                cmdline = raw.replace(b'\x00', b' ').decode('utf-8', errors='replace')
+                if 'start_converter.py' not in cmdline:
+                    continue
+                if VAR_DIR not in cmdline and 'fpkconverter' not in cmdline:
+                    continue
+                try:
+                    os.killpg(os.getpgid(pid), 15)
+                except Exception:
+                    try:
+                        os.kill(pid, 15)
+                    except Exception:
+                        continue
+                killed.append(pid)
+            except Exception:
+                continue
+        if killed:
+            print(f"已清理遗留旧转码进程: {killed}", flush=True)
+    except Exception as e:
+        print(f"清理遗留旧转码进程失败: {e}", flush=True)
+    return killed
+
 def _tail_lines(path, max_lines=80, max_bytes=65536):
     try:
         if not os.path.exists(path):
@@ -429,6 +468,7 @@ fpkc.FolderScanner(c["monitor_dir"],vc,max_depth=c.get("max_depth",3)).start()
             try: conv_log_file.close()
             except: pass
             conv_log_file = None
+        _kill_stale_converter_processes()
         _rotate_log_if_needed(CONV_LOG)
         conv_log_file = open(CONV_LOG, 'a')
         # fnOS 中 sys.executable 可能为空，回退到 python3；使用无缓冲模式确保日志实时写入

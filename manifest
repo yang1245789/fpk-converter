@@ -1,5 +1,5 @@
 appname               = fpkconverter
-version               = 1.0.49
+version               = 1.0.50
 display_name          = 视频转码
 desc                  = NAS视频转码（本地自用硬件转码版，支持访问 GPU 设备）
 arch                  = x86_64

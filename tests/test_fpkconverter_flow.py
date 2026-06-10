@@ -317,6 +317,12 @@ class WebServerFlowTests(unittest.TestCase):
         env = popen_calls[0]["env"] or {}
         self.assertTrue("-u" in args or env.get("PYTHONUNBUFFERED") == "1")
 
+    def test_start_button_cleans_stale_converter_processes_before_launch(self):
+        content = (APP_DIR / "web_server.py").read_text()
+
+        self.assertIn("def _kill_stale_converter_processes", content)
+        self.assertLess(content.index("_kill_stale_converter_processes()"), content.index("subprocess.Popen([py, '-u', sc]"))
+
     def test_stop_button_terminates_converter_process_group(self):
         self.client.post("/api/config", json={"monitor_dir": str(self.monitor_dir)})
         fake_proc = FakeProc()
