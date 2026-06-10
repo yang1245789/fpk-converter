@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import py_compile
 import sqlite3
 import subprocess
 import sys
@@ -63,9 +64,15 @@ class WebServerFlowTests(unittest.TestCase):
         self.monitor_dir = Path(self.tmp.name) / "media"
         self.monitor_dir.mkdir()
         self.web = load_web_server(self.var_dir)
+        self.original_popen = self.web.subprocess.Popen
+        self.original_getpgid = self.web.os.getpgid
+        self.original_killpg = self.web.os.killpg
         self.client = self.web.app.test_client()
 
     def tearDown(self):
+        self.web.subprocess.Popen = self.original_popen
+        self.web.os.getpgid = self.original_getpgid
+        self.web.os.killpg = self.original_killpg
         self.tmp.cleanup()
 
     def test_home_page_contains_all_user_buttons_and_controls(self):
@@ -161,13 +168,7 @@ class WebServerFlowTests(unittest.TestCase):
         self.assertTrue((self.var_dir / "start_config.json").exists())
         script_path = self.var_dir / "start_converter.py"
         self.assertTrue(script_path.exists())
-        py_compile = subprocess.run(
-            [sys.executable, "-m", "py_compile", str(script_path)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        self.assertEqual(py_compile.returncode, 0, py_compile.stderr)
+        py_compile.compile(str(script_path), doraise=True)
 
     def test_start_button_uses_unbuffered_python_for_realtime_logs(self):
         self.client.post("/api/config", json={"monitor_dir": str(self.monitor_dir)})
@@ -279,6 +280,7 @@ class WebServerFlowTests(unittest.TestCase):
 class ConverterLogicTests(unittest.TestCase):
     def setUp(self):
         self.converter_module = load_converter_module()
+        self.original_subprocess_run = self.converter_module.subprocess.run
         self.tmp = tempfile.TemporaryDirectory()
         self.work = Path(self.tmp.name)
         self.video = self.work / "sample.mp4"
@@ -286,6 +288,7 @@ class ConverterLogicTests(unittest.TestCase):
         self.db = self.converter_module.Database(str(self.work / "test.db"))
 
     def tearDown(self):
+        self.converter_module.subprocess.run = self.original_subprocess_run
         self.tmp.cleanup()
 
     def test_hevc_1080p_under_5mbps_is_skipped(self):
