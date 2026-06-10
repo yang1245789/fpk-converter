@@ -68,12 +68,18 @@ class WebServerFlowTests(unittest.TestCase):
         self.original_popen = self.web.subprocess.Popen
         self.original_getpgid = self.web.os.getpgid
         self.original_killpg = self.web.os.killpg
+        self.original_listdir = self.web.os.listdir
+        self.original_exists = self.web.os.path.exists
+        self.original_isdir = self.web.os.path.isdir
         self.client = self.web.app.test_client()
 
     def tearDown(self):
         self.web.subprocess.Popen = self.original_popen
         self.web.os.getpgid = self.original_getpgid
         self.web.os.killpg = self.original_killpg
+        self.web.os.listdir = self.original_listdir
+        self.web.os.path.exists = self.original_exists
+        self.web.os.path.isdir = self.original_isdir
         self.tmp.cleanup()
 
     def test_home_page_contains_all_user_buttons_and_controls(self):
@@ -187,13 +193,31 @@ class WebServerFlowTests(unittest.TestCase):
         for entry in data["entries"]:
             self.assertNotIn(entry["path"], {"/proc", "/sys", "/dev", "/etc", "/usr", "/var", "/run"})
 
-    def test_root_browse_exposes_fnnas_volume_entry_even_when_not_enumerable(self):
+    def test_root_browse_dynamically_exposes_existing_fnnas_volumes(self):
+        existing_paths = {f"/vol{i}" for i in range(1, 6)}
+
+        def fake_exists(path):
+            if path in existing_paths:
+                return True
+            return self.original_exists(path)
+
+        def fake_isdir(path):
+            if path in existing_paths:
+                return True
+            return self.original_isdir(path)
+
+        self.web.os.path.exists = fake_exists
+        self.web.os.path.isdir = fake_isdir
+
         response = self.client.get("/api/browse", query_string={"path": "/"})
 
         self.assertEqual(response.status_code, 200)
         data = response.get_json()
         paths = {entry["path"] for entry in data["entries"]}
-        self.assertIn("/vol3", paths)
+        for index in range(1, 6):
+            self.assertIn(f"/vol{index}", paths)
+        for index in range(6, 10):
+            self.assertNotIn(f"/vol{index}", paths)
 
     def test_save_config_allows_explicit_fnnas_volume_path(self):
         response = self.client.post("/api/config", json={"monitor_dir": "/vol3/1000/PORN"})
@@ -239,6 +263,8 @@ class WebServerFlowTests(unittest.TestCase):
         self.assertEqual(len(popen_calls), 1)
         self.assertTrue(popen_calls[0]["start_new_session"])
         self.assertTrue((self.var_dir / "start_config.json").exists())
+        start_config = json.loads((self.var_dir / "start_config.json").read_text())
+        self.assertEqual(start_config["max_depth"], 5)
         script_path = self.var_dir / "start_converter.py"
         self.assertTrue(script_path.exists())
         py_compile.compile(str(script_path), doraise=True)

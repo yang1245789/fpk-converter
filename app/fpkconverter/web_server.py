@@ -53,10 +53,11 @@ BLOCKED_PATH_PREFIXES = (
     '/bin', '/boot', '/dev', '/etc', '/lib', '/lib64', '/proc', '/root',
     '/run', '/sbin', '/sys', '/usr', '/var'
 )
-FIXED_VOLUME_ENTRYPOINTS = tuple(f'/vol{i}' for i in range(1, 10))
-ROOT_BROWSE_CANDIDATES = FIXED_VOLUME_ENTRYPOINTS + (
-    '/volume1', '/volume2', '/volume3', '/mnt', '/media', '/home', '/share', '/shares', '/tmp'
+VOLUME_SCAN_LIMIT = 32
+VOLUME_ENTRY_CANDIDATES = tuple(f'/vol{i}' for i in range(1, VOLUME_SCAN_LIMIT + 1)) + tuple(
+    f'/volume{i}' for i in range(1, VOLUME_SCAN_LIMIT + 1)
 )
+ROOT_BROWSE_CANDIDATES = VOLUME_ENTRY_CANDIDATES + ('/mnt', '/media', '/home', '/share', '/shares', '/tmp')
 cfg = dict(DEFAULT)
 proc = None
 conv_log_file = None
@@ -260,7 +261,7 @@ def api_start():
         'crf':cfg.get('crf',23), 'codec':cfg.get('codec','libx264'),
         'container':cfg.get('container','mp4'), 'preset':cfg.get('preset','medium'),
         'threads':cfg.get('threads',1), 'use_gpu':cfg.get('use_gpu',True),
-        'temp_dir': TEMP_DIR, 'max_depth': 3}, f)
+        'temp_dir': TEMP_DIR, 'max_depth': 5}, f)
     sc = os.path.join(VAR_DIR, 'start_converter.py')
     script_content = '''import sys,os,json,subprocess,traceback
 sd=os.path.dirname(os.path.abspath(__file__))
@@ -412,9 +413,7 @@ def api_browse():
             for full in ROOT_BROWSE_CANDIDATES:
                 if _is_blocked_system_path(full):
                     continue
-                if full in FIXED_VOLUME_ENTRYPOINTS:
-                    entries.append({'name':os.path.basename(full), 'path':full, 'is_dir':True})
-                elif os.path.exists(full):
+                if os.path.exists(full):
                     entries.append({'name':os.path.basename(full) or full, 'path':full, 'is_dir':os.path.isdir(full)})
         else:
             # 非根目录：先尝试 listdir，权限不足时尝试 isdir 回退
