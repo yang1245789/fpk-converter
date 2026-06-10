@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import py_compile
+import re
 import sqlite3
 import subprocess
 import sys
@@ -92,6 +93,23 @@ class WebServerFlowTests(unittest.TestCase):
         self.assertIn("id=\"current_activity\"", html)
         self.assertIn("id=\"last_error_text\"", html)
         self.assertIn("id=\"recent_log\"", html)
+
+    def test_home_page_javascript_is_syntax_valid(self):
+        response = self.client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        html = response.get_data(as_text=True)
+        scripts = re.findall(r"<script>([\s\S]*?)</script>", html)
+        self.assertTrue(scripts)
+        node_check = subprocess.run(
+            ["node", "--check"],
+            input="\n".join(scripts),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(node_check.returncode, 0, node_check.stdout)
 
     def test_save_config_button_endpoint_persists_valid_values(self):
         payload = {
