@@ -446,6 +446,11 @@ class VideoConverter:
             width = video_stream.get('width', 0)
             height = video_stream.get('height', 0)
             codec = video_stream.get('codec_name', '')
+            color_info = {}
+            for key in ('color_primaries', 'color_trc', 'colorspace', 'color_range', 'pix_fmt'):
+                value = video_stream.get(key)
+                if value and value != 'unknown':
+                    color_info[key] = value
             duration = 0.0
             for duration_raw in (video_stream.get('duration'), info.get('format', {}).get('duration')):
                 try:
@@ -468,7 +473,14 @@ class VideoConverter:
             if log_file and log_file.exists():
                 try: log_file.unlink()
                 except Exception: pass
-            return {'width': width, 'height': height, 'codec': codec, 'bit_rate': bit_rate, 'duration': duration}
+            return {
+                'width': width,
+                'height': height,
+                'codec': codec,
+                'bit_rate': bit_rate,
+                'duration': duration,
+                'color_info': color_info,
+            }
         except subprocess.TimeoutExpired:
             print(f"ffprobe 超时: {filepath}")
             if log_file and log_file.exists():
@@ -635,7 +647,7 @@ class VideoConverter:
         return f"{safe_stem}_{digest}"
 
     def _build_ffmpeg_cmd(self, input_path, output_path, target_codec, target_width, target_height, needs_resize,
-                          preset_override=None, progress=False, qsv_device=None):
+                          preset_override=None, progress=False, qsv_device=None, color_info=None):
         is_qsv = target_codec.endswith('_qsv')
         cmd = [self._ffmpeg_binary(), '-hide_banner', '-nostats']
         if is_qsv and qsv_device:
@@ -657,6 +669,19 @@ class VideoConverter:
 
         if needs_resize:
             cmd.extend(['-vf', f'scale={target_width}:{target_height}'])
+
+        color_info = color_info or {}
+        color_arg_map = (
+            ('color_primaries', '-color_primaries'),
+            ('color_trc', '-color_trc'),
+            ('colorspace', '-colorspace'),
+            ('color_range', '-color_range'),
+            ('pix_fmt', '-pix_fmt'),
+        )
+        for key, arg in color_arg_map:
+            value = color_info.get(key)
+            if value and value != 'unknown':
+                cmd.extend([arg, str(value)])
 
         cmd.extend(['-c:a', 'copy'])
         if self.container == 'mp4':
@@ -805,6 +830,9 @@ class VideoConverter:
             output_path = Path(tempfile.gettempdir()) / f"fpkc_{safe_stem}_tmp_{unique_id}.{self.container}"
         
         duration_seconds = float(video_info.get('duration') or 0)
+        color_info = video_info.get('color_info') or {}
+        if color_info:
+            print(f"保留源片色彩参数: {color_info}")
         qsv_devices = self._render_devices() if (self.use_gpu and target_codec.endswith('_qsv')) else []
         qsv_attempt_devices = qsv_devices or [None]
         cmd = None
@@ -817,7 +845,7 @@ class VideoConverter:
             result = None
             for attempt_index, qsv_device in enumerate(qsv_attempt_devices, 1):
                 cmd = self._build_ffmpeg_cmd(input_path, output_path, target_codec, target_width, target_height, needs_resize,
-                                             progress=duration_seconds > 0, qsv_device=qsv_device)
+                                             progress=duration_seconds > 0, qsv_device=qsv_device, color_info=color_info)
                 if qsv_device:
                     print(f"QSV 尝试 {attempt_index}/{len(qsv_attempt_devices)}: 使用设备 {qsv_device}")
                 print(f"ffmpeg 命令: {' '.join(cmd)}")
@@ -857,7 +885,8 @@ class VideoConverter:
                         try: output_path.unlink()
                         except: pass
                     fallback_cmd = self._build_ffmpeg_cmd(input_path, output_path, fallback_codec, target_width, target_height, needs_resize,
-                                                          preset_override='medium', progress=duration_seconds > 0)
+                                                          preset_override='medium', progress=duration_seconds > 0,
+                                                          color_info=color_info)
                     print(f"QSV 转码失败，自动降级 CPU 编码器重试: {fallback_codec}")
                     print(f"ffmpeg 降级命令: {' '.join(fallback_cmd)}")
                     result = self._run_ffmpeg_cmd(fallback_cmd, ffmpeg_log, duration_seconds, str(input_path))

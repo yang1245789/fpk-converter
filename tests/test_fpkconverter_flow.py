@@ -568,6 +568,53 @@ class ConverterLogicTests(unittest.TestCase):
         self.assertIn("-threads", cmd)
         self.assertEqual(cmd[cmd.index("-threads") + 1], "4")
 
+    def test_ffmpeg_command_preserves_source_color_metadata_when_present(self):
+        vc = self.converter_module.VideoConverter(self.db, use_gpu=True, temp_dir=str(self.work))
+        color_info = {
+            "color_primaries": "bt709",
+            "color_trc": "bt709",
+            "colorspace": "bt709",
+            "color_range": "tv",
+            "pix_fmt": "yuv420p",
+        }
+
+        cmd = vc._build_ffmpeg_cmd(
+            self.video,
+            self.work / "out.mp4",
+            "hevc_qsv",
+            1920,
+            1080,
+            False,
+            qsv_device="/dev/dri/renderD128",
+            color_info=color_info,
+        )
+
+        self.assertEqual(cmd[cmd.index("-color_primaries") + 1], "bt709")
+        self.assertEqual(cmd[cmd.index("-color_trc") + 1], "bt709")
+        self.assertEqual(cmd[cmd.index("-colorspace") + 1], "bt709")
+        self.assertEqual(cmd[cmd.index("-color_range") + 1], "tv")
+        self.assertEqual(cmd[cmd.index("-pix_fmt") + 1], "yuv420p")
+
+    def test_ffmpeg_command_does_not_invent_missing_color_metadata(self):
+        vc = self.converter_module.VideoConverter(self.db, use_gpu=True, temp_dir=str(self.work))
+
+        cmd = vc._build_ffmpeg_cmd(
+            self.video,
+            self.work / "out.mp4",
+            "hevc_qsv",
+            1920,
+            1080,
+            False,
+            qsv_device="/dev/dri/renderD128",
+            color_info={},
+        )
+
+        self.assertNotIn("-color_primaries", cmd)
+        self.assertNotIn("-color_trc", cmd)
+        self.assertNotIn("-colorspace", cmd)
+        self.assertNotIn("-color_range", cmd)
+        self.assertNotIn("-pix_fmt", cmd)
+
     def test_transcode_stable_wait_is_300_seconds(self):
         self.assertEqual(self.converter_module.VideoConverter.TRANSCODE_DELAY, 300)
 
