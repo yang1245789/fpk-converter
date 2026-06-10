@@ -1,115 +1,147 @@
 #!/bin/sh
-# v13 - 基于真实目录结构修复
-# 事实: cmd在/var/apps/fpkconverter/, app在/vol2/@appcenter/fpkconverter/
-# 通过 target 软链接找到 app 目录
+# 严格按飞牛 fnOS 官方开发文档：
+# - 启动失败时把诊断信息写入 ${TRIM_TEMP_LOGFILE}，应用中心会以 Dialog 弹窗给用户
+# - exit 0/1/3 分别代表 启动成功或运行中 / 失败 / 未运行
+# - 按官方约定使用 ${TRIM_APPDEST}（target 目录）/ ${TRIM_PKGVAR}（动态数据目录）
 
-LOG="${TRIM_PKGVAR:-/tmp}/fpkconverter/info.log"
-mkdir -p "$(dirname "$LOG")" 2>/dev/null
+LOG_DIR="${TRIM_PKGVAR:-/tmp/fpkconverter}"
+mkdir -p "$LOG_DIR" 2>/dev/null
+LOG="$LOG_DIR/info.log"
+PID_FILE="$LOG_DIR/app.pid"
+ACCESSIBLE_FILE="$LOG_DIR/accessible_paths"
 
-echo "=== $(date) arg=$1 ===" >> "$LOG"
+# 用户可见错误日志（系统会读它来弹 Dialog）
+USER_LOG="${TRIM_TEMP_LOGFILE:-$LOG_DIR/user_error.log}"
 
-# 定位安装根目录
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-echo "ROOT=$ROOT" >> "$LOG"
+log_msg() { echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG" 2>/dev/null; }
+report_user_err() {
+    # 写入用户可见日志，并保留到内部 log
+    echo "$1" > "$USER_LOG" 2>/dev/null
+    log_msg "USER_ERR: $1"
+}
 
-# 尝试 target 软链接
+# 解析应用代码目录（优先 TRIM_APPDEST，回退到 main 脚本相对路径）
+APP_BASE=""
+if [ -n "${TRIM_APPDEST}" ] && [ -d "${TRIM_APPDEST}" ]; then
+    APP_BASE="${TRIM_APPDEST}"
+fi
+if [ -z "$APP_BASE" ]; then
+    SELF_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+    if [ -L "$SELF_DIR/target" ]; then
+        APP_BASE="$(readlink -f "$SELF_DIR/target")"
+    elif [ -d "$SELF_DIR/app" ]; then
+        APP_BASE="$SELF_DIR/app"
+    else
+        APP_BASE="$SELF_DIR"
+    fi
+fi
+
+# 在 APP_BASE 下找 web_server.py
 APP_DIR=""
-if [ -L "$ROOT/target" ]; then
-    TARGET="$(readlink "$ROOT/target")"
-    echo "TARGET=$TARGET" >> "$LOG"
-    for d in "$TARGET/fpkconverter" "$TARGET/app/fpkconverter"; do
-        if [ -f "$d/web_server.py" ]; then
-            APP_DIR="$d"
-            break
-        fi
-    done
-fi
+for d in "$APP_BASE/fpkconverter" "$APP_BASE/app/fpkconverter" "$APP_BASE"; do
+    if [ -f "$d/web_server.py" ]; then
+        APP_DIR="$d"
+        break
+    fi
+done
 
-# 回退: 直接在 ROOT 下找
-if [ -z "$APP_DIR" ]; then
-    for d in "$ROOT/fpkconverter" "$ROOT/app/fpkconverter"; do
-        if [ -f "$d/web_server.py" ]; then
-            APP_DIR="$d"
-            break
-        fi
-    done
-fi
+log_msg "=== arg=$1 APP_BASE=$APP_BASE APP_DIR=$APP_DIR TRIM_APPDEST=${TRIM_APPDEST}"
 
-# 回退: TRIM_PKGVAR 的父目录
-if [ -z "$APP_DIR" ] && [ -n "${TRIM_PKGVAR}" ]; then
-    BASE="$(dirname "$TRIM_PKGVAR")"
-    for d in "$BASE/fpkconverter" "$BASE/app/fpkconverter"; do
-        if [ -f "$d/web_server.py" ]; then
-            APP_DIR="$d"
-            break
-        fi
-    done
-fi
-
-echo "APP_DIR=${APP_DIR:-NOT_FOUND}" >> "$LOG"
-
-if [ -n "$APP_DIR" ]; then
-    echo "ls APP_DIR:" >> "$LOG"
-    ls -la "$APP_DIR/" >> "$LOG" 2>&1
-fi
-
-VAR="${TRIM_PKGVAR:-/tmp/fpkconverter}"
-mkdir -p "$VAR" 2>/dev/null
-PID="$VAR/app.pid"
-
-check() {
-    [ -f "$PID" ] || return 1
-    p=$(head -n1 "$PID" 2>/dev/null | tr -d '[:space:]')
-    [ -z "$p" ] && { rm -f "$PID"; return 1; }
+check_running() {
+    [ -f "$PID_FILE" ] || return 1
+    p=$(head -n1 "$PID_FILE" 2>/dev/null | tr -d '[:space:]')
+    [ -z "$p" ] && { rm -f "$PID_FILE"; return 1; }
     kill -0 "$p" 2>/dev/null && return 0
-    rm -f "$PID"
+    rm -f "$PID_FILE"
     return 1
 }
 
-case $1 in
-start)
-    if check; then
-        echo "already running" >> "$LOG"
-        exit 0
+start_app() {
+    if check_running; then
+        log_msg "already running"
+        return 0
     fi
+
     if [ -z "$APP_DIR" ] || [ ! -f "$APP_DIR/web_server.py" ]; then
-        echo "FAIL: web_server.py not found" >> "$LOG"
-        exit 1
+        report_user_err "应用代码不完整：找不到 web_server.py。\n请尝试卸载后重新安装应用。"
+        return 1
     fi
-    cd "$APP_DIR" || { echo "FAIL cd" >> "$LOG"; exit 1; }
+
+    # 选 Python 解释器
+    PYTHON=""
+    for p in python3 python python3.11 python3.10 python3.9; do
+        if command -v "$p" >/dev/null 2>&1; then
+            PYTHON="$p"
+            break
+        fi
+    done
+    if [ -z "$PYTHON" ]; then
+        report_user_err "系统未安装 python3，请在 SSH 终端执行：\napt-get install -y python3"
+        return 1
+    fi
+
+    # 检查 ffmpeg（不阻断启动，但提示用户）
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        log_msg "WARN: ffmpeg not found"
+    fi
+
+    # 把当前授权目录写入文件，供 web 进程读取
+    if [ -n "${TRIM_DATA_ACCESSIBLE_PATHS}" ]; then
+        echo "${TRIM_DATA_ACCESSIBLE_PATHS}" > "$ACCESSIBLE_FILE" 2>/dev/null
+    fi
+
+    cd "$APP_DIR" || {
+        report_user_err "无法进入应用目录：$APP_DIR"
+        return 1
+    }
     export PYTHONPATH="$APP_DIR/packages:$PYTHONPATH"
     export PYTHONUNBUFFERED=1
-    # 尝试 python3，回退到 python
-    PYTHON="python3"
-    command -v python3 >/dev/null 2>&1 || PYTHON="python"
-    echo "Starting $PYTHON at $APP_DIR" >> "$LOG"
-    $PYTHON -u web_server.py >> "$VAR/app.log" 2>&1 &
-    echo $! > "$PID"
-    echo "Started PID=$!" >> "$LOG"
-    exit 0
-    ;;
-stop)
-    if [ -f "$PID" ]; then
-        p=$(head -n1 "$PID" | tr -d '[:space:]')
+
+    log_msg "Starting $PYTHON web_server.py at $APP_DIR"
+    "$PYTHON" -u web_server.py >> "$LOG_DIR/app.log" 2>&1 &
+    pid=$!
+    echo "$pid" > "$PID_FILE"
+    log_msg "Started PID=$pid"
+
+    # 给进程 1 秒判断是否立即崩了
+    sleep 1
+    if ! kill -0 "$pid" 2>/dev/null; then
+        tail_log=$(tail -n 30 "$LOG_DIR/app.log" 2>/dev/null)
+        report_user_err "应用启动后立即退出。日志末尾：\n$tail_log"
+        rm -f "$PID_FILE"
+        return 1
+    fi
+    return 0
+}
+
+stop_app() {
+    if [ -f "$PID_FILE" ]; then
+        p=$(head -n1 "$PID_FILE" | tr -d '[:space:]')
         if [ -n "$p" ]; then
             kill -TERM "$p" 2>/dev/null
-            # 等待进程退出，最多3秒
-            for i in 1 2 3; do
+            for i in 1 2 3 4 5; do
                 sleep 1
                 kill -0 "$p" 2>/dev/null || break
             done
-            # 如果还在，强制杀死
             if kill -0 "$p" 2>/dev/null; then
                 kill -KILL "$p" 2>/dev/null
                 sleep 1
             fi
         fi
-        rm -f "$PID"
+        rm -f "$PID_FILE"
     fi
-    exit 0
+    return 0
+}
+
+case $1 in
+start)
+    if start_app; then exit 0; else exit 1; fi
+    ;;
+stop)
+    stop_app && exit 0 || exit 1
     ;;
 status)
-    check && exit 0 || exit 3
+    check_running && exit 0 || exit 3
     ;;
 *)
     exit 1

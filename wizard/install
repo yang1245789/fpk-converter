@@ -1,0 +1,15 @@
+[
+    {
+        "stepTitle": "安装提示",
+        "items": [
+            {
+                "type": "tips",
+                "helpText": "本应用用于自动监控指定目录下的视频文件并使用 ffmpeg 进行转码压缩。<br/>安装完成后，请前往 <b>应用设置 → 授权目录</b> 授予需要监控的目录的<b>读写权限</b>，否则应用无法访问您的视频文件。"
+            },
+            {
+                "type": "tips",
+                "helpText": "请确认系统已安装 <code>ffmpeg</code>。如未安装，可在 SSH 终端执行 <code>apt-get install ffmpeg</code>。"
+            }
+        ]
+    }
+]

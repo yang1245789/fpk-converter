@@ -1,7 +1,7 @@
 appname               = fpkconverter
-version               = 1.0.0
+version               = 1.0.41
 display_name          = 视频转码
-desc                  = NAS视频转码
+desc                  = NAS视频转码（自动监控目录并使用 ffmpeg 转码压缩）
 arch                  = x86_64
 source                = thirdparty
 maintainer            = yang

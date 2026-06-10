@@ -29,6 +29,9 @@ if os.path.isdir(PKG_DIR) and PKG_DIR not in sys.path:
 DB_PATH     = os.path.join(VAR_DIR, 'fpk_converter.db')
 CONFIG_PATH = os.path.join(VAR_DIR, 'config.json')
 CONV_LOG    = os.path.join(VAR_DIR, 'converter.log')
+# 由 cmd/config_callback 把 TRIM_DATA_ACCESSIBLE_PATHS 写入此文件，
+# 让 web 进程在用户变更授权后无需重启即可感知。
+ACCESSIBLE_PATHS_FILE = os.path.join(VAR_DIR, 'accessible_paths')
 
 import subprocess, sqlite3, time, json, threading
 from flask import Flask, render_template_string, request, jsonify
@@ -49,15 +52,15 @@ DEFAULT = {'monitor_dir':'','crf':23,'codec':'libx264','container':'mp4',
 MIN_CRF = 18
 MAX_CRF = 32
 MAX_THREADS = 4
+# 严格按照飞牛官方规范：应用只能浏览
+# 1) TRIM_DATA_ACCESSIBLE_PATHS 中由用户在"应用设置→授权目录"显式授权的目录
+# 2) TRIM_DATA_SHARE_PATHS 中由 config/resource:data-share 声明的共享目录
+# 这两个变量由 fnOS 在脚本/服务启动时注入；变更时通过 cmd/config_callback 通知。
+# 应用从不主动扫描 /、/vol*、/mnt 等系统/挂载目录。
 BLOCKED_PATH_PREFIXES = (
     '/bin', '/boot', '/dev', '/etc', '/lib', '/lib64', '/proc', '/root',
     '/run', '/sbin', '/sys', '/usr', '/var'
 )
-VOLUME_SCAN_LIMIT = 32
-VOLUME_ENTRY_CANDIDATES = tuple(f'/vol{i}' for i in range(1, VOLUME_SCAN_LIMIT + 1)) + tuple(
-    f'/volume{i}' for i in range(1, VOLUME_SCAN_LIMIT + 1)
-)
-ROOT_BROWSE_CANDIDATES = VOLUME_ENTRY_CANDIDATES + ('/mnt', '/media', '/home', '/share', '/shares', '/tmp')
 cfg = dict(DEFAULT)
 proc = None
 conv_log_file = None
@@ -119,12 +122,68 @@ def _is_blocked_system_path(path):
     return any(normalized == prefix or normalized.startswith(prefix + os.sep)
                for prefix in BLOCKED_PATH_PREFIXES)
 
+def _split_path_list(s):
+    """按官方约定（冒号分隔）解析 TRIM_DATA_* 类路径列表。"""
+    if not s:
+        return []
+    result = []
+    for raw in str(s).split(':'):
+        item = raw.strip()
+        if not item or not item.startswith('/'):
+            continue
+        n, _ = _normalize_abs_path(item)
+        if n and not _is_blocked_system_path(n):
+            if n not in result:
+                result.append(n)
+    return result
+
+def _read_accessible_paths_file():
+    """从持久化文件读取（cmd/config_callback 写入）。"""
+    if not ACCESSIBLE_PATHS_FILE or not os.path.exists(ACCESSIBLE_PATHS_FILE):
+        return []
+    try:
+        with open(ACCESSIBLE_PATHS_FILE) as f:
+            return _split_path_list(f.read().replace('\n', ':'))
+    except Exception:
+        return []
+
+def get_authorized_roots():
+    """返回应用当前可访问的根目录列表，严格按官方规范：
+    1. TRIM_DATA_ACCESSIBLE_PATHS（用户在"应用设置→授权目录"中授权的）
+    2. TRIM_DATA_SHARE_PATHS（config/resource:data-share 声明的）
+    3. 持久化文件（cmd/config_callback 写入）作为运行时 env 不更新的回退
+    """
+    roots = []
+    for src in (
+        os.environ.get('TRIM_DATA_ACCESSIBLE_PATHS', ''),
+        os.environ.get('TRIM_DATA_SHARE_PATHS', ''),
+    ):
+        for p in _split_path_list(src):
+            if p not in roots:
+                roots.append(p)
+    for p in _read_accessible_paths_file():
+        if p not in roots:
+            roots.append(p)
+    return roots
+
+def _is_under_authorized_root(path):
+    """检查 path 是否位于已授权的根目录之下（含相等）。"""
+    if not path:
+        return False
+    for root in get_authorized_roots():
+        if path == root or path.startswith(root.rstrip('/') + os.sep):
+            return True
+    return False
+
 def _validate_user_directory(path, must_exist=False):
     normalized, err = _normalize_abs_path(path)
     if not normalized:
         return None, err
     if _is_blocked_system_path(normalized):
         return None, f'禁止选择系统目录: {normalized}'
+    if not _is_under_authorized_root(normalized):
+        return None, (f'目录未授权访问: {normalized}\n'
+                      f'请前往"应用设置→授权目录"对该目录授予读写权限')
     if must_exist and not os.path.isdir(normalized):
         return None, f'目录不存在: {normalized}'
     return normalized, ''
@@ -235,7 +294,8 @@ def api_status():
     process, lines = _process_snapshot()
     display_error = last_error or process.get('last_error', '')
     return jsonify({'running':process['running'], 'config':cfg, 'error':display_error,
-                    'process':process, 'recent_log':lines})
+                    'process':process, 'recent_log':lines,
+                    'authorized_roots': get_authorized_roots()})
 
 TEMP_DIR = os.path.join(VAR_DIR, 'temp')
 
@@ -401,11 +461,6 @@ def api_browse():
     if not normalized:
         return jsonify({'error':err}), 400
     p = normalized
-    if p != '/' and _is_blocked_system_path(p):
-        return jsonify({'error':f'禁止浏览系统目录: {p}'}), 403
-    # 限制路径深度，防止过深遍历
-    if p.count('/') > 10:
-        return jsonify({'error':'Path too deep'}), 400
     entries = []
     def add_entry(name, path, is_dir=True, extra=None):
         if any(e.get('path') == path for e in entries):
@@ -414,48 +469,59 @@ def api_browse():
         if extra:
             item.update(extra)
         entries.append(item)
-    try:
-        if p == '/':
-            # 根目录只暴露常见媒体/挂载入口，避免用户误选系统目录。
-            for full in ROOT_BROWSE_CANDIDATES:
-                if _is_blocked_system_path(full):
-                    continue
-                if os.path.exists(full):
-                    add_entry(os.path.basename(full) or full, full, os.path.isdir(full))
-            saved_dir = cfg.get('monitor_dir', '')
-            normalized_saved, _ = _validate_user_directory(saved_dir, must_exist=False)
-            if normalized_saved and os.path.isdir(normalized_saved):
-                add_entry(f"当前监控目录: {normalized_saved}", normalized_saved, True, {'pinned':True})
-        else:
-            # 非根目录：先尝试 listdir，权限不足时尝试 isdir 回退
+    roots = get_authorized_roots()
+    if p == '/':
+        # 根目录视图：仅展示用户在 fnOS"应用设置→授权目录"中授权的目录
+        # 以及通过 config/resource:data-share 声明的共享目录。
+        if not roots:
+            return jsonify({
+                'path': '/',
+                'entries': [],
+                'message': ('当前应用没有任何已授权的目录。\n'
+                            '请前往 fnOS：应用 → 视频转码 → 应用设置 → 授权目录，\n'
+                            '为需要监控的目录（例如 /vol3/1000/PORN）授予“读写”权限后再返回。')
+            })
+        for root in roots:
             try:
-                items = sorted(os.listdir(p))
-                for item in items:
-                    if len(entries) >= 500:
-                        break
-                    full = os.path.join(p, item)
-                    try:
-                        is_dir = os.path.isdir(full)
-                        add_entry(item, full, is_dir)
-                    except PermissionError:
-                        add_entry(item, full, True, {'no_access':True})
-                    except OSError:
-                        pass
-            except PermissionError:
-                # listdir 失败但路径可能是一个可访问的目录（如挂载点根）
-                # 尝试用 isdir 确认，如果是目录则返回空列表（允许进入）
-                try:
-                    if os.path.isdir(p):
-                        entries = []
-                    else:
-                        return jsonify({'error':'无权限访问此目录'}), 403
-                except Exception:
-                    return jsonify({'error':'无权限访问此目录'}), 403
+                if os.path.exists(root):
+                    add_entry(root, root, os.path.isdir(root))
+                else:
+                    # 已授权但当前不存在（例如卷未挂载），仍展示让用户感知
+                    add_entry(root + '（不可访问）', root, True, {'no_access': True})
+            except OSError:
+                add_entry(root + '（不可访问）', root, True, {'no_access': True})
+        return jsonify({'path': '/', 'entries': entries})
+
+    # 非根目录：必须位于已授权根之下
+    if _is_blocked_system_path(p):
+        return jsonify({'error': f'禁止浏览系统目录: {p}'}), 403
+    if not _is_under_authorized_root(p):
+        return jsonify({'error': (
+            f'目录未授权访问: {p}\n'
+            f'请前往“应用设置→授权目录”授予该目录的读写权限。'
+        )}), 403
+    if p.count('/') > 12:
+        return jsonify({'error': 'Path too deep'}), 400
+    try:
+        items = sorted(os.listdir(p))
     except PermissionError:
-        return jsonify({'error':'无权限访问此目录'}), 403
-    except Exception as e:
-        return jsonify({'error':str(e)}), 500
-    return jsonify({'path':p, 'entries':entries})
+        return jsonify({'error': '无权限访问此目录（请在应用设置中授予读写权限）'}), 403
+    except FileNotFoundError:
+        return jsonify({'error': '目录不存在'}), 404
+    except OSError as e:
+        return jsonify({'error': str(e)}), 500
+    for item in items:
+        if len(entries) >= 500:
+            break
+        full = os.path.join(p, item)
+        try:
+            is_dir = os.path.isdir(full)
+            add_entry(item, full, is_dir)
+        except PermissionError:
+            add_entry(item, full, True, {'no_access': True})
+        except OSError:
+            pass
+    return jsonify({'path': p, 'entries': entries})
 
 HTML = '''<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -495,7 +561,7 @@ function saveCfg(){let d={monitor_dir:el('monitor_dir').value,crf:parseInt(el('c
 async function refresh(){try{let s=await fetch('/api/status').then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});let b=el('badge');b.textContent=s.running?'运行中':'已停止';b.className='badge '+(s.running?'bg':'br');s.config&&(el('monitor_dir').value=s.config.monitor_dir,el('crf').value=s.config.crf,el('preset').value=s.config.preset,el('threads').value=s.config.threads,el('codec').value=s.config.codec,el('container').value=s.config.container,el('use_gpu').checked=s.config.use_gpu!==false);let p=s.process||{};el('process_pid').textContent=p.pid||'-';el('process_uptime').textContent=p.uptime_seconds!=null?(p.uptime_seconds+' 秒'):'-';el('current_file').textContent=p.current_file||'-';el('current_activity').textContent=p.current_activity||'-';el('last_error_text').textContent=s.error||p.last_error||'无';el('recent_log').textContent=(s.recent_log&&s.recent_log.length)?s.recent_log.join('\\n'):'暂无日志';let l=await fetch('/api/logs').then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});el('ts').textContent=l.total_saved_mb;el('tc2').textContent=l.logs.length;let t=el('tb');t.innerHTML='';l.logs.forEach(r=>{let tr=document.createElement('tr');['filepath','file_size_mb','saved_size_mb'].forEach(k=>{let td=document.createElement('td');td.textContent=r[k];tr.appendChild(td)});let sd=document.createElement('td');sd.textContent=r.success?'成功':'失败';sd.className=r.success?'suc':'err';tr.appendChild(sd);let td=document.createElement('td');td.textContent=r.processed_at;tr.appendChild(td);t.appendChild(tr)})}catch(e){console.error('refresh error:',e)}}
 function el(id){return document.getElementById(id)}
 var browsePath='/';
-async function openBrowser(p){if(p){browsePath=p}else{let v=(el('monitor_dir').value||'').trim();browsePath=v.startsWith('/')?v:'/'}try{let d=await fetch('/api/browse?path='+encodeURIComponent(browsePath)).then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});if(d.error){alert(d.error);return}let m=el('modal'),lst=el('blist');browsePath=d.path;el('bpath').textContent=d.path;if(el('browser_path_input'))el('browser_path_input').value=d.path;lst.innerHTML='';if(d.path!=='/'){let b=document.createElement('div');b.className='bitem';b.textContent='.. 返回上级';b.onclick=()=>openBrowser(d.path.split('/').slice(0,-1).join('/')||'/');lst.appendChild(b)}d.entries.forEach(e=>{let b=document.createElement('div');b.className='bitem';b.textContent=e.name+(e.is_dir?'/':'');if(e.pinned){b.style.fontWeight='600';b.title='已保存的监控目录'}if(e.no_access){b.style.opacity='0.4';b.title='无权限';if(e.is_dir)b.onclick=()=>alert('无权限访问此目录')}else if(e.is_dir){b.onclick=()=>openBrowser(e.path)}else{b.style.opacity='0.5'}lst.appendChild(b)});m.style.display='flex'}catch(e){alert('浏览目录失败: '+e.message)}}
+async function openBrowser(p){if(p){browsePath=p}else{let v=(el('monitor_dir').value||'').trim();browsePath=v.startsWith('/')?v:'/'}try{let d=await fetch('/api/browse?path='+encodeURIComponent(browsePath)).then(r=>{if(!r.ok)return r.json().then(j=>{throw new Error(j.error||r.status)});return r.json()});if(d.error){alert(d.error);return}let m=el('modal'),lst=el('blist');browsePath=d.path;el('bpath').textContent=d.path;if(el('browser_path_input'))el('browser_path_input').value=d.path;lst.innerHTML='';if(d.message){let tip=document.createElement('div');tip.style.cssText='padding:12px 14px;background:#fef3c7;color:#78350f;border-radius:8px;margin-bottom:10px;white-space:pre-wrap;font-size:13px;line-height:1.5';tip.textContent=d.message;lst.appendChild(tip)}if(d.path!=='/'){let b=document.createElement('div');b.className='bitem';b.textContent='.. 返回上级';b.onclick=()=>openBrowser(d.path.split('/').slice(0,-1).join('/')||'/');lst.appendChild(b)}d.entries.forEach(e=>{let b=document.createElement('div');b.className='bitem';b.textContent=e.name+(e.is_dir?'/':'');if(e.pinned){b.style.fontWeight='600';b.title='已保存的监控目录'}if(e.no_access){b.style.opacity='0.4';b.title='无权限';if(e.is_dir)b.onclick=()=>alert('无权限访问此目录（请在应用设置 → 授权目录中授予读写权限）')}else if(e.is_dir){b.onclick=()=>openBrowser(e.path)}else{b.style.opacity='0.5'}lst.appendChild(b)});m.style.display='flex'}catch(e){alert('浏览目录失败: '+e.message)}}
 function openBrowserFromInput(){let p=(el('browser_path_input').value||'').trim();if(!p){alert('请输入完整路径');return}openBrowser(p)}
 function selectDir(){el('monitor_dir').value=browsePath;el('modal').style.display='none';saveCfg()}
 refresh();setInterval(refresh,5000)</script>

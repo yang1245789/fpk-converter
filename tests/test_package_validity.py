@@ -40,8 +40,12 @@ class FpkPackageValidityTests(unittest.TestCase):
         self.assertTrue((REPO_ROOT / "ICON.PNG").is_file())
         self.assertTrue((REPO_ROOT / "ICON_256.PNG").is_file())
         self.assertTrue((REPO_ROOT / "cmd" / "main").is_file())
+        self.assertTrue((REPO_ROOT / "cmd" / "config_callback").is_file())
         self.assertTrue((REPO_ROOT / "config" / "privilege").is_file())
         self.assertTrue((REPO_ROOT / "config" / "resource").is_file())
+        self.assertTrue((REPO_ROOT / "wizard" / "install").is_file())
+        self.assertTrue((REPO_ROOT / "wizard" / "uninstall").is_file())
+        self.assertTrue((REPO_ROOT / "wizard" / "config").is_file())
         self.assertTrue((REPO_ROOT / "app" / "ui" / "config").is_file())
         self.assertFalse((REPO_ROOT / "app" / "ui" / "config").is_dir())
 
@@ -88,6 +92,10 @@ class FpkPackageValidityTests(unittest.TestCase):
                         "config",
                         "config/privilege",
                         "config/resource",
+                        "wizard",
+                        "wizard/install",
+                        "wizard/uninstall",
+                        "wizard/config",
                         "ICON.PNG",
                         "ICON_256.PNG",
                         "manifest",

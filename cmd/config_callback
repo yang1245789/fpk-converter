@@ -1,2 +1,20 @@
 #!/bin/sh
+# 飞牛官方 config_callback 钩子：
+# 当用户在"应用设置→授权目录"或其他配置变更时，系统会调用此脚本。
+# 在这里把最新的 TRIM_DATA_ACCESSIBLE_PATHS 写入持久化文件，
+# 让正在运行的 web 进程下次请求时读取到新值（无需重启服务）。
+
+LOG_DIR="${TRIM_PKGVAR:-/tmp/fpkconverter}"
+mkdir -p "$LOG_DIR" 2>/dev/null
+ACCESSIBLE_FILE="$LOG_DIR/accessible_paths"
+LOG="$LOG_DIR/info.log"
+
+echo "$(date '+%Y-%m-%d %H:%M:%S') config_callback args=$* TRIM_DATA_ACCESSIBLE_PATHS=${TRIM_DATA_ACCESSIBLE_PATHS}" >> "$LOG" 2>/dev/null
+
+if [ -n "${TRIM_DATA_ACCESSIBLE_PATHS}" ]; then
+    echo "${TRIM_DATA_ACCESSIBLE_PATHS}" > "$ACCESSIBLE_FILE" 2>/dev/null
+else
+    : > "$ACCESSIBLE_FILE" 2>/dev/null
+fi
+
 exit 0

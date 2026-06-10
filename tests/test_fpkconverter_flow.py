@@ -15,8 +15,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 APP_DIR = REPO_ROOT / "app" / "fpkconverter"
 
 
-def load_web_server(var_dir: Path):
+def load_web_server(var_dir: Path, accessible_paths=None):
     os.environ["TRIM_PKGVAR"] = str(var_dir)
+    if accessible_paths is None:
+        os.environ["TRIM_DATA_ACCESSIBLE_PATHS"] = ""
+    else:
+        os.environ["TRIM_DATA_ACCESSIBLE_PATHS"] = ":".join(accessible_paths)
+    os.environ.setdefault("TRIM_DATA_SHARE_PATHS", "")
     module_name = f"web_server_test_{os.getpid()}_{id(var_dir)}"
     spec = importlib.util.spec_from_file_location(module_name, APP_DIR / "web_server.py")
     module = importlib.util.module_from_spec(spec)
@@ -64,7 +69,8 @@ class WebServerFlowTests(unittest.TestCase):
         self.var_dir.mkdir()
         self.monitor_dir = Path(self.tmp.name) / "media"
         self.monitor_dir.mkdir()
-        self.web = load_web_server(self.var_dir)
+        # 模拟 fnOS 在"应用设置→授权目录"为本测试目录授予 rw
+        self.web = load_web_server(self.var_dir, accessible_paths=[str(self.monitor_dir)])
         self.original_popen = self.web.subprocess.Popen
         self.original_getpgid = self.web.os.getpgid
         self.original_killpg = self.web.os.killpg
@@ -195,92 +201,59 @@ class WebServerFlowTests(unittest.TestCase):
         for entry in data["entries"]:
             self.assertNotIn(entry["path"], {"/proc", "/sys", "/dev", "/etc", "/usr", "/var", "/run"})
 
-    def test_root_browse_dynamically_exposes_existing_fnnas_volumes(self):
-        existing_paths = {f"/vol{i}" for i in range(1, 6)}
-
-        def fake_exists(path):
-            if path in existing_paths:
-                return True
-            return self.original_exists(path)
-
-        def fake_isdir(path):
-            if path in existing_paths:
-                return True
-            return self.original_isdir(path)
-
-        self.web.os.path.exists = fake_exists
-        self.web.os.path.isdir = fake_isdir
-
+    def test_root_browse_only_shows_authorized_paths(self):
+        # 严格按官方规范：根目录视图只展示 TRIM_DATA_ACCESSIBLE_PATHS 中的目录
         response = self.client.get("/api/browse", query_string={"path": "/"})
-
         self.assertEqual(response.status_code, 200)
         data = response.get_json()
         paths = {entry["path"] for entry in data["entries"]}
-        for index in range(1, 6):
-            self.assertIn(f"/vol{index}", paths)
-        for index in range(6, 10):
-            self.assertNotIn(f"/vol{index}", paths)
+        self.assertEqual(paths, {str(self.monitor_dir)})
 
-    def test_root_browse_includes_saved_monitor_dir_even_when_parent_is_not_listable(self):
-        granted_dir = "/vol3/1000/PORN"
-        self.web.cfg["monitor_dir"] = granted_dir
+    def test_root_browse_shows_helpful_message_when_no_grant(self):
+        # 用户尚未在"应用设置→授权目录"授权时，应给出友好提示
+        empty_var = Path(self.tmp.name) / "empty_var"
+        empty_var.mkdir()
+        empty_web = load_web_server(empty_var, accessible_paths=[])
+        client = empty_web.app.test_client()
+        response = client.get("/api/browse", query_string={"path": "/"})
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["entries"], [])
+        self.assertIn("授权目录", data.get("message", ""))
 
-        def fake_exists(path):
-            if path in {"/vol3", "/vol3/1000"}:
-                return False
-            if path == granted_dir:
-                return True
-            return self.original_exists(path)
+    def test_browse_rejects_paths_outside_authorized_roots(self):
+        # 即使是合法的非系统目录，也必须先被授权才能浏览
+        response = self.client.get("/api/browse", query_string={"path": "/tmp"})
+        self.assertEqual(response.status_code, 403)
+        data = response.get_json()
+        self.assertIn("未授权", data["error"])
 
-        def fake_isdir(path):
-            if path == granted_dir:
-                return True
-            if path in {"/vol3", "/vol3/1000"}:
-                return False
-            return self.original_isdir(path)
+    def test_browse_can_open_authorized_subdirectory(self):
+        # 已授权的目录及其子目录可以浏览
+        sub = self.monitor_dir / "sub"
+        sub.mkdir()
+        (sub / "movie.mp4").write_bytes(b"x")
+        response = self.client.get("/api/browse", query_string={"path": str(sub)})
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        names = {e["name"] for e in data["entries"]}
+        self.assertIn("movie.mp4", names)
 
-        self.web.os.path.exists = fake_exists
-        self.web.os.path.isdir = fake_isdir
-
+    def test_accessible_paths_file_is_a_runtime_fallback(self):
+        # cmd/config_callback 写入文件后，web 进程下一次浏览即生效（无需重启）
+        new_dir = Path(self.tmp.name) / "another"
+        new_dir.mkdir()
+        (self.var_dir / "accessible_paths").write_text(str(new_dir))
         response = self.client.get("/api/browse", query_string={"path": "/"})
-
         self.assertEqual(response.status_code, 200)
-        data = response.get_json()
-        paths = {entry["path"] for entry in data["entries"]}
-        self.assertIn(granted_dir, paths)
+        paths = {e["path"] for e in response.get_json()["entries"]}
+        self.assertIn(str(new_dir), paths)
 
-    def test_browse_can_open_granted_leaf_directory_without_listing_parents(self):
-        granted_dir = "/vol3/1000/PORN"
-
-        def fake_listdir(path):
-            if path == granted_dir:
-                return ["movie.mp4"]
-            raise PermissionError(path)
-
-        def fake_isdir(path):
-            if path == granted_dir:
-                return True
-            if path == f"{granted_dir}/movie.mp4":
-                return False
-            return self.original_isdir(path)
-
-        self.web.os.listdir = fake_listdir
-        self.web.os.path.isdir = fake_isdir
-
-        response = self.client.get("/api/browse", query_string={"path": granted_dir})
-
+    def test_status_endpoint_exposes_authorized_roots(self):
+        response = self.client.get("/api/status")
         self.assertEqual(response.status_code, 200)
-        data = response.get_json()
-        self.assertEqual(data["path"], granted_dir)
-        self.assertEqual(data["entries"][0]["name"], "movie.mp4")
-
-    def test_save_config_allows_explicit_fnnas_volume_path(self):
-        response = self.client.post("/api/config", json={"monitor_dir": "/vol3/1000/PORN"})
-
-        self.assertEqual(response.status_code, 200)
-        data = response.get_json()
-        self.assertTrue(data["success"])
-        self.assertEqual(data["config"]["monitor_dir"], "/vol3/1000/PORN")
+        roots = response.get_json().get("authorized_roots", [])
+        self.assertIn(str(self.monitor_dir), roots)
 
     def test_start_stop_buttons_create_runtime_files_and_update_status(self):
         self.client.post("/api/config", json={"monitor_dir": str(self.monitor_dir)})
