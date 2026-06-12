@@ -624,6 +624,48 @@ class ConverterLogicTests(unittest.TestCase):
     def test_transcode_stable_wait_is_300_seconds(self):
         self.assertEqual(self.converter_module.VideoConverter.TRANSCODE_DELAY, 300)
 
+    def test_queued_file_wait_time_counts_from_enqueue_not_worker_start(self):
+        vc = self.converter_module.VideoConverter(self.db, temp_dir=str(self.work))
+        second_video = self.work / "second.mp4"
+        second_video.write_bytes(b"x" * (11 * 1000 * 1000))
+        vc.TRANSCODE_DELAY = 300
+        first_path = str(self.video.resolve())
+        second_path = str(second_video.resolve())
+        queued_at = max(os.path.getmtime(first_path), os.path.getmtime(second_path)) + 1
+        vc._queue = [
+            {"path": first_path, "queued_at": queued_at},
+            {"path": second_path, "queued_at": queued_at},
+        ]
+        vc._enforce_temp_limit = lambda: None
+        vc._cleanup_transcode_logs = lambda: None
+        converted = []
+        now = [queued_at]
+        original_time = self.converter_module.time.time
+        original_sleep = self.converter_module.time.sleep
+
+        def fake_convert(path):
+            converted.append(str(Path(path).resolve()))
+            if len(converted) == 1:
+                now[0] += 400
+            return True, None
+
+        def fake_sleep(seconds):
+            if seconds == 5 and converted:
+                raise AssertionError("第二个文件已经在队列中等满 300 秒，不能再次等待稳定期")
+            now[0] += seconds
+
+        try:
+            vc.convert_video = fake_convert
+            self.converter_module.time.time = lambda: now[0]
+            self.converter_module.time.sleep = fake_sleep
+
+            vc._serial_worker()
+        finally:
+            self.converter_module.time.time = original_time
+            self.converter_module.time.sleep = original_sleep
+
+        self.assertEqual(converted, [first_path, second_path])
+
     def test_failed_file_retry_uses_cooldown_before_next_attempt(self):
         vc = self.converter_module.VideoConverter(self.db)
         now = [1000]

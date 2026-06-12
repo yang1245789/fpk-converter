@@ -12,7 +12,7 @@ import hashlib
 import re
 from pathlib import Path
 
-VERSION = '1.0.50'
+VERSION = '1.0.51'
 
 
 class Database:
@@ -567,17 +567,17 @@ class VideoConverter:
                 self._active_paths.add(filepath_str)
             
             try:
-                wait_start = time.time()
+                wait_until = queued_at + self.TRANSCODE_DELAY
                 last_wait_log = 0
-                while time.time() - wait_start < self.TRANSCODE_DELAY:
+                while time.time() < wait_until:
                     if not os.path.exists(filepath_str):
                         print(f"文件在等待期间被删除，跳过: {filepath_str}")
                         break
-                    remaining = int(self.TRANSCODE_DELAY - (time.time() - wait_start))
+                    remaining = int(wait_until - time.time())
                     if last_wait_log == 0 or time.time() - last_wait_log >= 30 or remaining <= 5:
                         print(f"文件已入队，等待文件稳定: {filepath_str}，剩余约 {max(0, remaining)} 秒")
                         last_wait_log = time.time()
-                    time.sleep(5)
+                    time.sleep(min(5, max(1, remaining)))
                 
                 if not os.path.exists(filepath_str):
                     continue
