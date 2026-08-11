@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -1007,6 +1008,75 @@ class ConverterLogicTests(unittest.TestCase):
         self.assertEqual(removed, 0)
         self.assertTrue(self.db.is_file_processed(str(self.video.resolve())))
 
+    def test_database_vacuum_compacts_after_cleanup(self):
+        """cleanup_and_vacuum 应删除过期记录并压缩数据库文件"""
+        for i in range(100):
+            self.db.add_processed_file(f"/nonexistent/file_{i}.mp4", 1000 * 1000, True, 500000)
+        db_path = self.work / "test.db"
+        size_before = db_path.stat().st_size
+
+        removed = self.db.cleanup_and_vacuum()
+
+        self.assertEqual(removed, 100)
+        self.assertLess(db_path.stat().st_size, size_before)
+        self.db.add_processed_file(str(self.video.resolve()), 100, True, 0)
+        self.assertTrue(self.db.is_file_processed(str(self.video.resolve())))
+
+    def test_database_cleanup_and_vacuum_preserves_valid_records(self):
+        """cleanup_and_vacuum 不会删除有效记录"""
+        self.db.add_processed_file(str(self.video.resolve()), 11 * 1000 * 1000, True, 5000)
+
+        removed = self.db.cleanup_and_vacuum()
+
+        self.assertEqual(removed, 0)
+        self.assertTrue(self.db.is_file_processed(str(self.video.resolve())))
+
+    def test_startup_cleanup_removes_old_temp_files(self):
+        """启动清理应删除旧的临时转码文件和日志"""
+        vc = self.converter_module.VideoConverter(
+            self.db, temp_dir=str(self.work), use_gpu=False)
+        old_time = time.time() - 3600
+        old_temp = self.work / "old_video_tmp_999_0.mp4"
+        old_temp.write_bytes(b"x" * 100)
+        os.utime(old_temp, (old_time, old_time))
+        old_log = self.work / "ffmpeg_999_0.log"
+        old_log.write_bytes(b"x" * 100)
+        os.utime(old_log, (old_time, old_time))
+        self.db.add_processed_file(str(self.video.resolve()), 11 * 1000 * 1000, True, 5000)
+
+        vc.startup_cleanup()
+
+        self.assertFalse(old_temp.exists())
+        self.assertFalse(old_log.exists())
+        self.assertTrue(self.db.is_file_processed(str(self.video.resolve())))
+
+    def test_startup_cleanup_does_not_remove_recent_temp_files(self):
+        """启动清理不应删除最近创建的临时文件"""
+        vc = self.converter_module.VideoConverter(
+            self.db, temp_dir=str(self.work), use_gpu=False)
+        recent_temp = self.work / "recent_tmp.mp4"
+        recent_temp.write_bytes(b"x" * 100)
+
+        vc.startup_cleanup()
+
+        self.assertTrue(recent_temp.exists())
+
+    def test_folder_scanner_start_calls_startup_cleanup(self):
+        """FolderScanner.start() 应在扫描前调用 startup_cleanup"""
+        vc = self.converter_module.VideoConverter(
+            self.db, temp_dir=str(self.work), use_gpu=False)
+        cleanup_called = []
+        vc.startup_cleanup = lambda: cleanup_called.append(True)
+        scanner = self.converter_module.FolderScanner(
+            str(self.work), vc, interval=10, max_depth=0)
+        # 用 Event 让 start() 在第一次扫描后退出
+        scanner._stop = self.converter_module.threading.Event()
+        scanner._stop.set()
+
+        scanner.start()
+
+        self.assertTrue(cleanup_called, "FolderScanner.start() 应调用 startup_cleanup")
+
     def test_convert_video_uses_ffmpeg_binary_not_bare_ffmpeg(self):
         """convert_video 检查 ffmpeg 可用性时应使用 _ffmpeg_binary() 而非裸 'ffmpeg'"""
         vc = self.converter_module.VideoConverter(
@@ -1057,6 +1127,25 @@ class PackageEntryPointTests(unittest.TestCase):
         content = (APP_DIR / "web_server.py").read_text()
 
         self.assertIn("fpk_converter.VERSION", content)
+
+    def test_start_script_calls_folder_scanner_start(self):
+        """start_converter.py 脚本应调用 FolderScanner(...).start()，触发 startup_cleanup"""
+        content = (APP_DIR / "web_server.py").read_text()
+
+        self.assertIn("FolderScanner", content)
+        self.assertIn(".start()", content)
+
+    def test_folder_scanner_start_contains_startup_cleanup(self):
+        """FolderScanner.start() 方法体中应包含 startup_cleanup 调用"""
+        content = (APP_DIR / "fpk_converter.py").read_text()
+
+        start_method = content.split("def start(self):", 1)[1]
+        # 取 start 方法的前几行（到下一个 def 或 class 之前）
+        end = start_method.find("\n    def ")
+        if end == -1:
+            end = start_method.find("\nclass ")
+        start_body = start_method[:end] if end > 0 else start_method[:500]
+        self.assertIn("startup_cleanup", start_body)
 
 
 if __name__ == "__main__":
