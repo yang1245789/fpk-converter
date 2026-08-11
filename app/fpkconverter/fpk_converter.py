@@ -12,7 +12,7 @@ import hashlib
 import re
 from pathlib import Path
 
-VERSION = '1.0.52'
+VERSION = '1.0.53'
 
 
 class Database:
@@ -129,6 +129,19 @@ class Database:
         except Exception as e:
             print(f"数据库清理失败: {e}")
             return 0
+
+    def cleanup_and_vacuum(self):
+        """清理过期记录并压缩数据库文件，返回删除的条数"""
+        removed = self.cleanup_stale_records()
+        try:
+            conn = self._get_connection()
+            try:
+                conn.execute('VACUUM')
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"数据库压缩失败: {e}")
+        return removed
 
 
 class VideoConverter:
@@ -281,6 +294,32 @@ class VideoConverter:
                 p.unlink()
             except Exception:
                 pass
+
+    def startup_cleanup(self):
+        """启动时清理旧版残留的临时转码文件和日志，压缩数据库。
+        不会删除最近 5 分钟内创建的文件（可能正在使用），也不会删除数据库中的有效记录。"""
+        now = self._now()
+        if self.temp_dir and self.temp_dir.is_dir():
+            for item in self.temp_dir.iterdir():
+                if not item.is_file():
+                    continue
+                name = item.name
+                is_temp_output = '_tmp_' in name
+                is_ffmpeg_log = name.startswith('ffmpeg_') and name.endswith('.log')
+                is_ffprobe_log = name.startswith('ffprobe_') and name.endswith('.log')
+                if not (is_temp_output or is_ffmpeg_log or is_ffprobe_log):
+                    continue
+                try:
+                    age = now - item.stat().st_mtime
+                    if age < 300:
+                        continue
+                    item.unlink()
+                except Exception:
+                    pass
+        if self.db:
+            removed = self.db.cleanup_and_vacuum()
+            if removed > 0:
+                print(f"启动清理: 删除了 {removed} 条过期数据库记录并压缩数据库")
 
     def _mediasrv_path(self):
         for path in ('/usr/trim/lib/mediasrv',):
@@ -1052,8 +1091,10 @@ class FolderScanner:
         self._stop = threading.Event()
 
     def start(self):
-        # 启动时清理数据库中文件已不存在的过期记录
-        if hasattr(self.converter, 'db') and self.converter.db:
+        # 启动时清理旧版残留的临时文件、过期数据库记录并压缩数据库
+        if hasattr(self.converter, 'startup_cleanup'):
+            self.converter.startup_cleanup()
+        elif hasattr(self.converter, 'db') and self.converter.db:
             removed = self.converter.db.cleanup_stale_records()
             if removed > 0:
                 print(f"清理了 {removed} 条过期数据库记录（对应文件已不存在）")
