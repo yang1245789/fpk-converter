@@ -12,7 +12,7 @@ import hashlib
 import re
 from pathlib import Path
 
-VERSION = '1.0.51'
+VERSION = '1.0.52'
 
 
 class Database:
@@ -107,6 +107,28 @@ class Database:
         except Exception as e:
             print(f"数据库查询失败: {e}")
             return []
+
+    def cleanup_stale_records(self):
+        """删除文件已不存在的数据库记录，返回删除的条数"""
+        try:
+            conn = self._get_connection()
+            try:
+                cursor = conn.cursor()
+                cursor.execute('SELECT id, filepath FROM processed_files')
+                stale_ids = []
+                for row in cursor.fetchall():
+                    record_id, filepath = row[0], row[1]
+                    if not os.path.exists(filepath):
+                        stale_ids.append((record_id,))
+                if stale_ids:
+                    cursor.executemany('DELETE FROM processed_files WHERE id = ?', stale_ids)
+                    conn.commit()
+                return len(stale_ids)
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"数据库清理失败: {e}")
+            return 0
 
 
 class VideoConverter:
@@ -523,6 +545,11 @@ class VideoConverter:
             return
         
         filepath_str = str(filepath)
+        
+        # 入队前检查数据库：已成功转码的文件直接跳过，避免无意义的 300 秒等待
+        if self.db.is_file_processed(filepath_str):
+            return
+        
         allowed, remaining, reason = self._can_attempt_file(filepath_str)
         if not allowed:
             print(f"跳过暂不可重试文件: {filepath_str}，{reason}")
@@ -780,7 +807,7 @@ class VideoConverter:
 
         # 检查 ffmpeg 是否可用
         try:
-            subprocess.run(['ffmpeg', '-version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            subprocess.run([self._ffmpeg_binary(), '-version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
         except FileNotFoundError:
             print("错误: ffmpeg 未安装或不在 PATH 中，无法转码")
             return False, 0
@@ -1025,6 +1052,11 @@ class FolderScanner:
         self._stop = threading.Event()
 
     def start(self):
+        # 启动时清理数据库中文件已不存在的过期记录
+        if hasattr(self.converter, 'db') and self.converter.db:
+            removed = self.converter.db.cleanup_stale_records()
+            if removed > 0:
+                print(f"清理了 {removed} 条过期数据库记录（对应文件已不存在）")
         print(f"开始定时扫描: {self.folder_path} (间隔{self.interval}秒, 最大深度{self.max_depth})")
         self._scan(self.folder_path, 0)
         while not self._stop.is_set():

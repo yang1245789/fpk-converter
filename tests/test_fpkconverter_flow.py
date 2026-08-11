@@ -953,6 +953,85 @@ class ConverterLogicTests(unittest.TestCase):
         for bad_char in " @[]":
             self.assertNotIn(bad_char, temp_name)
 
+    def test_queue_file_skips_already_transcoded_file(self):
+        """已成功转码的文件不应被加入等待队列"""
+        vc = self.converter_module.VideoConverter(self.db)
+        vc._ensure_worker = lambda: None
+        vc._deduplicate_event = lambda filepath: True
+        self.db.add_processed_file(str(self.video.resolve()), 11 * 1000 * 1000, True, 5000)
+
+        vc.queue_file(self.video)
+
+        self.assertEqual(vc._queue, [])
+
+    def test_queue_file_enqueues_unprocessed_file(self):
+        """未转码的文件应被加入队列"""
+        vc = self.converter_module.VideoConverter(self.db)
+        vc._ensure_worker = lambda: None
+        vc._deduplicate_event = lambda filepath: True
+
+        vc.queue_file(self.video)
+
+        self.assertEqual(len(vc._queue), 1)
+        self.assertEqual(vc._queue[0]['path'], str(self.video.resolve()))
+
+    def test_queue_file_enqueues_failed_file_for_retry(self):
+        """转码失败的文件仍可被加入队列重试"""
+        vc = self.converter_module.VideoConverter(self.db)
+        vc._ensure_worker = lambda: None
+        vc._deduplicate_event = lambda filepath: True
+        self.db.add_processed_file(str(self.video.resolve()), 11 * 1000 * 1000, False)
+
+        vc.queue_file(self.video)
+
+        self.assertEqual(len(vc._queue), 1)
+
+    def test_database_cleanup_removes_stale_records(self):
+        """数据库清理应删除文件已不存在的记录"""
+        self.db.add_processed_file("/nonexistent/file1.mp4", 1000, True, 500)
+        self.db.add_processed_file("/nonexistent/file2.mp4", 2000, True, 800)
+        self.db.add_processed_file(str(self.video.resolve()), 11 * 1000 * 1000, True, 5000)
+
+        removed = self.db.cleanup_stale_records()
+
+        self.assertEqual(removed, 2)
+        self.assertTrue(self.db.is_file_processed(str(self.video.resolve())))
+        self.assertFalse(self.db.is_file_processed("/nonexistent/file1.mp4"))
+
+    def test_database_cleanup_preserves_existing_records(self):
+        """数据库清理应保留文件仍存在的记录"""
+        self.db.add_processed_file(str(self.video.resolve()), 11 * 1000 * 1000, True, 5000)
+
+        removed = self.db.cleanup_stale_records()
+
+        self.assertEqual(removed, 0)
+        self.assertTrue(self.db.is_file_processed(str(self.video.resolve())))
+
+    def test_convert_video_uses_ffmpeg_binary_not_bare_ffmpeg(self):
+        """convert_video 检查 ffmpeg 可用性时应使用 _ffmpeg_binary() 而非裸 'ffmpeg'"""
+        vc = self.converter_module.VideoConverter(
+            self.db, codec="libx264", container="mp4", use_gpu=False, temp_dir=str(self.work))
+        vc.get_video_info = lambda path: {"width": 1920, "height": 1080, "codec": "h264", "bit_rate": 8_000_000}
+        vc._ffmpeg_binary = lambda: "/usr/trim/lib/mediasrv/bin/ffmpeg"
+        version_cmds = []
+
+        def fake_run(cmd, stdout=None, stderr=None, timeout=None, **kwargs):
+            version_cmds.append(cmd)
+            if "-version" in cmd:
+                return subprocess.CompletedProcess(cmd, 0)
+            if cmd and "-i" in cmd:
+                output_path = Path(cmd[-1])
+                output_path.write_bytes(b"x" * 1000)
+                return subprocess.CompletedProcess(cmd, 0)
+            return subprocess.CompletedProcess(cmd, 0)
+
+        self.converter_module.subprocess.run = fake_run
+
+        vc.convert_video(self.video)
+
+        version_cmd = next(c for c in version_cmds if "-version" in c)
+        self.assertEqual(version_cmd[0], "/usr/trim/lib/mediasrv/bin/ffmpeg")
+
 
 class PackageEntryPointTests(unittest.TestCase):
     def test_cmd_main_starts_web_server_with_unbuffered_logs(self):

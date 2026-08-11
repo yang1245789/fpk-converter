@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 *.fpk
 *.so
+.tools/
+boot.log
+crash.log
