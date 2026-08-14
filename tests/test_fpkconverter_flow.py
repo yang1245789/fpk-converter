@@ -147,12 +147,14 @@ class WebServerFlowTests(unittest.TestCase):
         self.assertEqual(data["problems"], [])
 
     def test_problems_endpoint_reflects_db_records(self):
-        """/api/problems 应返回数据库中登记的问题文件"""
+        """/api/problems 应返回数据库中登记的问题文件（需真实存在，否则会被自清理）"""
+        broken = self.monitor_dir / "broken.mp4"
+        broken.write_bytes(b"x" * 16)
         self.client.get("/api/problems")  # 触发表结构创建
         db = sqlite3.connect(os.path.join(self.var_dir, "fpk_converter.db"))
         try:
             db.execute("INSERT INTO problem_files (filepath, reason, failure_count, file_size) VALUES (?,?,?,?)",
-                       ("/media/broken.mp4", "文件损坏或不可读（ffprobe 无法获取视频信息）", 3, 1000000))
+                       (str(broken), "文件损坏或不可读（ffprobe 无法获取视频信息）", 3, 1000000))
             db.commit()
         finally:
             db.close()
@@ -162,9 +164,25 @@ class WebServerFlowTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         items = response.get_json()["problems"]
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]["filepath"], "/media/broken.mp4")
+        self.assertEqual(items[0]["filepath"], str(broken))
         self.assertIn("损坏", items[0]["reason"])
         self.assertEqual(items[0]["failure_count"], 3)
+
+    def test_problems_endpoint_self_cleans_missing_files(self):
+        """/api/problems 应自动删除文件已不存在的问题记录"""
+        self.client.get("/api/problems")  # 触发表结构创建
+        db = sqlite3.connect(os.path.join(self.var_dir, "fpk_converter.db"))
+        try:
+            db.execute("INSERT INTO problem_files (filepath, reason, failure_count, file_size) VALUES (?,?,?,?)",
+                       ("/media/gone.mp4", "损坏", 3, 100))
+            db.commit()
+        finally:
+            db.close()
+
+        response = self.client.get("/api/problems")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["problems"], [])
 
     def test_problem_delete_rejects_unregistered_path(self):
         """删除接口应拒绝处理不在问题文件列表中的路径"""
@@ -1123,6 +1141,54 @@ class ConverterLogicTests(unittest.TestCase):
         self.assertFalse(self.db.is_problem_file(path))
         allowed, _, _ = vc._can_attempt_file(path)
         self.assertTrue(allowed)
+
+    def test_can_attempt_resets_after_ui_recheck_removes_db_record(self):
+        """关键回归：UI"重新检测"删除数据库记录后，转码进程内存状态应自动复位允许重试"""
+        vc = self.converter_module.VideoConverter(self.db)
+        path = str(self.video.resolve())
+        for _ in range(vc.MAX_FAILURE_RETRIES):
+            vc._record_failure_for_retry(path, '损坏')
+        self.assertTrue(self.db.is_problem_file(path))
+        allowed, _, _ = vc._can_attempt_file(path)
+        self.assertFalse(allowed)
+
+        # 模拟 web 进程的 recheck 接口：仅删除数据库记录，转码进程不知情
+        self.db.remove_problem_file(path)
+
+        allowed, _, _ = vc._can_attempt_file(path)
+        self.assertTrue(allowed)
+
+    def test_record_problem_file_accumulates_failure_count(self):
+        """failure_count 应累计真实失败次数而非每次记 1"""
+        path = str(self.video.resolve())
+        self.db.record_problem_file(path, '损坏', 100, failure_count=3)
+        self.db.record_problem_file(path, '损坏', 100, failure_count=3)
+
+        items = self.db.get_problem_files()
+        self.assertEqual(items[0]['failure_count'], 6)
+
+    def test_record_failure_at_max_writes_real_failure_count(self):
+        """达重试上限时写入数据库的 failure_count 应等于实际失败次数"""
+        vc = self.converter_module.VideoConverter(self.db)
+        path = str(self.video.resolve())
+        for _ in range(vc.MAX_FAILURE_RETRIES):
+            vc._record_failure_for_retry(path, '损坏')
+
+        items = self.db.get_problem_files()
+        self.assertEqual(items[0]['failure_count'], vc.MAX_FAILURE_RETRIES)
+
+    def test_combined_skip_query_covers_processed_and_problem(self):
+        """单连接合并查询应同时覆盖已转码和问题文件两类跳过"""
+        self.db.add_processed_file(str(self.video.resolve()), 11 * 1000 * 1000, True, 5000)
+        self.assertTrue(self.db.is_file_processed_or_problem(str(self.video.resolve()))[0])
+
+        fresh = str((self.work / "fresh.mp4").resolve())
+        self.assertFalse(self.db.is_file_processed_or_problem(fresh)[0])
+
+        self.db.record_problem_file(fresh, '损坏', 100)
+        skip, processed = self.db.is_file_processed_or_problem(fresh)
+        self.assertTrue(skip)
+        self.assertFalse(processed)
 
     def test_database_cleanup_removes_stale_records(self):
         """数据库清理应删除文件已不存在的记录"""
