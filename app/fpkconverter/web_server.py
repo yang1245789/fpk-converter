@@ -570,13 +570,19 @@ def api_problems():
         db = sqlite3.connect(DB_PATH)
         try:
             rows = db.execute('SELECT filepath, reason, first_failed_at, last_attempt_at, failure_count, file_size FROM problem_files ORDER BY last_attempt_at DESC').fetchall()
+            # 自清理：文件已不存在的记录直接删除，不再等转码进程重启
+            stale = [r[0] for r in rows if not os.path.exists(r[0])]
+            if stale:
+                db.executemany('DELETE FROM problem_files WHERE filepath = ?', [(s,) for s in stale])
+                db.commit()
+                rows = [r for r in rows if os.path.exists(r[0])]
         finally:
             db.close()
         for r in rows:
             items.append({'filepath':str(r[0]),'reason':str(r[1] or ''),
                 'first_failed_at':str(r[2]),'last_attempt_at':str(r[3]),
                 'failure_count':r[4],'file_size_mb':round((r[5] or 0)/1048576,2),
-                'exists':os.path.exists(r[0])})
+                'exists':True})
     except Exception: pass
     return jsonify({'problems':items})
 
