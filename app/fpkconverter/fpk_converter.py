@@ -12,7 +12,7 @@ import hashlib
 import re
 from pathlib import Path
 
-VERSION = '1.0.53'
+VERSION = '1.0.54'
 
 
 class Database:
@@ -57,6 +57,16 @@ class Database:
                 ''')
                 cursor.execute('''
                     CREATE INDEX IF NOT EXISTS idx_filepath ON processed_files (filepath)
+                ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS problem_files (
+                        filepath TEXT PRIMARY KEY,
+                        reason TEXT DEFAULT '',
+                        first_failed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_attempt_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        failure_count INTEGER DEFAULT 0,
+                        file_size INTEGER DEFAULT 0
+                    )
                 ''')
                 conn.commit()
             finally:
@@ -110,6 +120,7 @@ class Database:
 
     def cleanup_stale_records(self):
         """删除文件已不存在的数据库记录，返回删除的条数"""
+        removed = 0
         try:
             conn = self._get_connection()
             try:
@@ -122,13 +133,92 @@ class Database:
                         stale_ids.append((record_id,))
                 if stale_ids:
                     cursor.executemany('DELETE FROM processed_files WHERE id = ?', stale_ids)
-                    conn.commit()
-                return len(stale_ids)
+                    removed += len(stale_ids)
+                # 问题文件表中文件已不存在的记录一并清理
+                cursor.execute('SELECT filepath FROM problem_files')
+                stale_problems = [row[0] for row in cursor.fetchall() if not os.path.exists(row[0])]
+                for fp in stale_problems:
+                    cursor.execute('DELETE FROM problem_files WHERE filepath = ?', (fp,))
+                removed += len(stale_problems)
+                conn.commit()
+                return removed
             finally:
                 conn.close()
         except Exception as e:
             print(f"数据库清理失败: {e}")
-            return 0
+            return removed
+
+    def record_problem_file(self, filepath, reason='', file_size=0):
+        """记录一个判定为损坏/永久转码失败的问题文件"""
+        try:
+            conn = self._get_connection()
+            try:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO problem_files (filepath, reason, last_attempt_at, failure_count, file_size)
+                    VALUES (?, ?, CURRENT_TIMESTAMP, 1, ?)
+                    ON CONFLICT(filepath) DO UPDATE SET
+                        reason = excluded.reason,
+                        last_attempt_at = CURRENT_TIMESTAMP,
+                        failure_count = failure_count + 1,
+                        file_size = excluded.file_size
+                ''', (str(filepath), reason, int(file_size or 0)))
+                conn.commit()
+            finally:
+                conn.close()
+        except sqlite3.Error as e:
+            print(f"记录问题文件失败: {e}")
+
+    def is_problem_file(self, filepath):
+        """判断文件是否已被标记为问题文件（损坏/永久失败）"""
+        try:
+            conn = self._get_connection()
+            try:
+                cursor = conn.cursor()
+                cursor.execute('SELECT 1 FROM problem_files WHERE filepath = ?', (str(filepath),))
+                return cursor.fetchone() is not None
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"查询问题文件失败: {e}")
+            return False
+
+    def get_problem_files(self):
+        """返回所有问题文件的详细信息列表"""
+        try:
+            conn = self._get_connection()
+            try:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT filepath, reason, first_failed_at, last_attempt_at, failure_count, file_size
+                    FROM problem_files ORDER BY last_attempt_at DESC
+                ''')
+                return [{
+                    'filepath': r[0],
+                    'reason': r[1] or '',
+                    'first_failed_at': str(r[2]),
+                    'last_attempt_at': str(r[3]),
+                    'failure_count': r[4],
+                    'file_size': r[5] or 0,
+                } for r in cursor.fetchall()]
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"查询问题文件失败: {e}")
+            return []
+
+    def remove_problem_file(self, filepath):
+        """从问题文件表中移除某文件（用于重新检测或删除后清理）"""
+        try:
+            conn = self._get_connection()
+            try:
+                cursor = conn.cursor()
+                cursor.execute('DELETE FROM problem_files WHERE filepath = ?', (str(filepath),))
+                conn.commit()
+            finally:
+                conn.close()
+        except sqlite3.Error as e:
+            print(f"删除问题文件记录失败: {e}")
 
     def cleanup_and_vacuum(self):
         """清理过期记录并压缩数据库文件，返回删除的条数"""
@@ -184,6 +274,7 @@ class VideoConverter:
         self.failure_retry_state = {}
         self.failure_lock = threading.Lock()
         self._qsv_disabled = False
+        self._last_failure_reason = '转码失败'
 
     def _now(self):
         return time.time()
@@ -233,7 +324,7 @@ class VideoConverter:
                 return False, remaining, f'等待重试冷却，剩余约 {remaining} 秒'
             return True, 0, ''
 
-    def _record_failure_for_retry(self, filepath_str):
+    def _record_failure_for_retry(self, filepath_str, reason=None):
         with self.failure_lock:
             state = self.failure_retry_state.get(filepath_str, {'failures': 0, 'next_retry_at': 0})
             failures = int(state.get('failures', 0)) + 1
@@ -241,7 +332,14 @@ class VideoConverter:
             if failures >= self.MAX_FAILURE_RETRIES:
                 state['next_retry_at'] = 0
                 self.failure_retry_state[filepath_str] = state
-                print(f"转码失败已达到 {self.MAX_FAILURE_RETRIES} 次，停止自动重试: {filepath_str}")
+                # 达到重试上限：持久化为问题文件，后续扫描静默跳过，不再刷日志
+                try:
+                    size = os.path.getsize(filepath_str) if os.path.exists(filepath_str) else 0
+                except Exception:
+                    size = 0
+                if self.db:
+                    self.db.record_problem_file(filepath_str, reason or '转码失败', size)
+                print(f"转码失败已达到 {self.MAX_FAILURE_RETRIES} 次，停止自动重试，已加入问题文件列表: {filepath_str}")
                 return None
             delay = self.FAILURE_RETRY_DELAYS[min(failures - 1, len(self.FAILURE_RETRY_DELAYS) - 1)]
             next_retry_at = self._now() + delay
@@ -253,6 +351,12 @@ class VideoConverter:
     def _clear_failure_retry(self, filepath_str):
         with self.failure_lock:
             self.failure_retry_state.pop(filepath_str, None)
+
+    def clear_problem_file(self, filepath_str):
+        """清除问题文件标记与内存重试状态（用于 UI 重新检测）"""
+        self._clear_failure_retry(filepath_str)
+        if self.db:
+            self.db.remove_problem_file(filepath_str)
 
     def _gpu_diagnostic_message(self):
         if not self.use_gpu:
@@ -588,7 +692,11 @@ class VideoConverter:
         # 入队前检查数据库：已成功转码的文件直接跳过，避免无意义的 300 秒等待
         if self.db.is_file_processed(filepath_str):
             return
-        
+
+        # 已判定的问题/损坏文件（达重试上限）静默跳过，避免每次扫描刷一行日志
+        if self.db.is_problem_file(filepath_str):
+            return
+
         allowed, remaining, reason = self._can_attempt_file(filepath_str)
         if not allowed:
             print(f"跳过暂不可重试文件: {filepath_str}，{reason}")
@@ -671,7 +779,7 @@ class VideoConverter:
                 if success:
                     self._clear_failure_retry(filepath_str)
                 else:
-                    self._record_failure_for_retry(filepath_str)
+                    self._record_failure_for_retry(filepath_str, getattr(self, '_last_failure_reason', None))
             except Exception as e:
                 print(f"转码异常: {e}")
                 traceback.print_exc()
@@ -855,6 +963,7 @@ class VideoConverter:
 
         video_info = self.get_video_info(input_path)
         if not video_info:
+            self._last_failure_reason = '文件损坏或不可读（ffprobe 无法获取视频信息）'
             print(f"无法获取视频信息: {input_path}")
             return False, 0
         
@@ -942,6 +1051,7 @@ class VideoConverter:
                 break
 
             if result.returncode != 0:
+                self._last_failure_reason = '转码失败（ffmpeg 报错，详见 var/temp/ffmpeg_*.log）'
                 err_msg = 'Unknown error'
                 if ffmpeg_log.exists():
                     try: err_msg = ffmpeg_log.read_text()[-1000:]
