@@ -123,6 +123,22 @@ def init_db():
     except Exception as e:
         print(f"init_db error: {e}")
 
+def _ensure_problem_schema():
+    """确保 problem_files 表存在（接口在转码核心首次运行前也可安全调用）"""
+    try:
+        c = sqlite3.connect(DB_PATH)
+        try:
+            c.execute('''CREATE TABLE IF NOT EXISTS problem_files(
+                filepath TEXT PRIMARY KEY, reason TEXT DEFAULT '',
+                first_failed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_attempt_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                failure_count INTEGER DEFAULT 0, file_size INTEGER DEFAULT 0)''')
+            c.commit()
+        finally:
+            c.close()
+    except Exception as e:
+        print(f"_ensure_problem_schema error: {e}")
+
 load_cfg(); init_db()
 
 def _normalize_abs_path(path):
@@ -546,6 +562,81 @@ def api_logs():
         total += r[5] or 0
     return jsonify({'logs':logs,'total_saved_mb':round(total/1048576,2)})
 
+@app.route('/api/problems')
+def api_problems():
+    _ensure_problem_schema()
+    items = []
+    try:
+        db = sqlite3.connect(DB_PATH)
+        try:
+            rows = db.execute('SELECT filepath, reason, first_failed_at, last_attempt_at, failure_count, file_size FROM problem_files ORDER BY last_attempt_at DESC').fetchall()
+        finally:
+            db.close()
+        for r in rows:
+            items.append({'filepath':str(r[0]),'reason':str(r[1] or ''),
+                'first_failed_at':str(r[2]),'last_attempt_at':str(r[3]),
+                'failure_count':r[4],'file_size_mb':round((r[5] or 0)/1048576,2),
+                'exists':os.path.exists(r[0])})
+    except Exception: pass
+    return jsonify({'problems':items})
+
+@app.route('/api/problems/delete', methods=['POST'])
+def api_problem_delete():
+    _ensure_problem_schema()
+    data = request.get_json(silent=True) or {}
+    fp = (data.get('filepath') or '').strip()
+    if not fp:
+        return jsonify({'success':False,'error':'缺少文件路径'}), 400
+    # 仅允许删除问题文件表中登记的文件，防止误删任意路径
+    try:
+        db = sqlite3.connect(DB_PATH)
+        try:
+            row = db.execute('SELECT filepath FROM problem_files WHERE filepath = ?', (fp,)).fetchone()
+        finally:
+            db.close()
+    except Exception as e:
+        return jsonify({'success':False,'error':f'数据库错误: {e}'}), 500
+    if not row:
+        return jsonify({'success':False,'error':'该文件不在问题文件列表中，拒绝删除'}), 400
+    if _is_blocked_system_path(fp):
+        return jsonify({'success':False,'error':'禁止删除系统目录下的文件'}), 403
+    if not _is_under_authorized_root(fp):
+        return jsonify({'success':False,'error':'文件不在已授权目录内，拒绝删除'}), 403
+    try:
+        if os.path.isdir(fp):
+            return jsonify({'success':False,'error':'仅支持删除文件，不支持目录'}), 400
+        if os.path.exists(fp):
+            os.remove(fp)
+    except Exception as e:
+        return jsonify({'success':False,'error':f'删除失败: {e}'}), 500
+    try:
+        db = sqlite3.connect(DB_PATH)
+        try:
+            db.execute('DELETE FROM problem_files WHERE filepath = ?', (fp,))
+            db.commit()
+        finally:
+            db.close()
+    except Exception: pass
+    return jsonify({'success':True})
+
+@app.route('/api/problems/recheck', methods=['POST'])
+def api_problem_recheck():
+    _ensure_problem_schema()
+    data = request.get_json(silent=True) or {}
+    fp = (data.get('filepath') or '').strip()
+    if not fp:
+        return jsonify({'success':False,'error':'缺少文件路径'}), 400
+    try:
+        db = sqlite3.connect(DB_PATH)
+        try:
+            db.execute('DELETE FROM problem_files WHERE filepath = ?', (fp,))
+            db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        return jsonify({'success':False,'error':f'数据库错误: {e}'}), 500
+    return jsonify({'success':True})
+
 @app.route('/api/browse')
 def api_browse():
     p = request.args.get('path', '/')
@@ -647,6 +738,10 @@ HTML = '''<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <div class="info">日志: {{conv_log}} | 数据库: {{db_path}}</div>
 </div>
 <div class="s"><div class="st">统计</div><div class="stats"><div class="sc"><div class="sv" id="ts">0</div><div class="sl">节省(MB)</div></div><div class="sc"><div class="sv" id="tc2">0</div><div class="sl">处理文件</div></div></div></div>
+<div class="s"><div class="st"><span>问题文件（损坏 / 转码失败）</span><button class="btn bt1" style="padding:4px 12px;font-size:12px;background:#6b7280" onclick="loadProblems()">刷新</button></div>
+<div id="prob_empty" class="info">暂无问题文件</div>
+<div class="tc" id="prob_wrap" style="display:none"><table><thead><tr><th>文件</th><th>失败原因</th><th>重试次数</th><th>大小(MB)</th><th>操作</th></tr></thead><tbody id="prob_tb"></tbody></table></div>
+<div class="info">说明：达重试上限的文件会进入此列表并被静默跳过（不再刷日志）。可"重新检测"（修复后重试）或"删除文件"（永久删除，不可恢复）。</div></div>
 <div class="s"><div class="st">转码日志</div><div class="tc"><table><thead><tr><th>文件</th><th>原大小</th><th>节省</th><th>状态</th><th>时间</th></tr></thead><tbody id="tb"></tbody></table></div></div></div></div>
 <script>
 function api(a){fetch('/api/'+a,{method:'POST'}).then(r=>{if(!r.ok)throw new Error(r.status);return r.json()}).then(d=>{if(d.error){el('errmsg').textContent=d.error;el('errmsg').style.display='block'}else{el('errmsg').style.display='none'}refresh()}).catch(e=>{el('errmsg').textContent='请求失败: '+e.message;el('errmsg').style.display='block'})}
@@ -657,7 +752,10 @@ var browsePath='/';
 async function openBrowser(p){if(p){browsePath=p}else{let v=(el('monitor_dir').value||'').trim();browsePath=v.startsWith('/')?v:'/'}try{let d=await fetch('/api/browse?path='+encodeURIComponent(browsePath)).then(r=>{if(!r.ok)return r.json().then(j=>{throw new Error(j.error||r.status)});return r.json()});if(d.error){alert(d.error);return}let m=el('modal'),lst=el('blist');browsePath=d.path;el('bpath').textContent=d.path;if(el('browser_path_input'))el('browser_path_input').value=d.path;lst.innerHTML='';if(d.message){let tip=document.createElement('div');tip.style.cssText='padding:12px 14px;background:#fef3c7;color:#78350f;border-radius:8px;margin-bottom:10px;white-space:pre-wrap;font-size:13px;line-height:1.5';tip.textContent=d.message;lst.appendChild(tip)}if(d.path!=='/'){let b=document.createElement('div');b.className='bitem';b.textContent='.. 返回上级';b.onclick=()=>openBrowser(d.path.split('/').slice(0,-1).join('/')||'/');lst.appendChild(b)}d.entries.forEach(e=>{let b=document.createElement('div');b.className='bitem';b.textContent=e.name+(e.is_dir?'/':'');if(e.pinned){b.style.fontWeight='600';b.title='已保存的监控目录'}if(e.no_access){b.style.opacity='0.4';b.title='无权限';if(e.is_dir)b.onclick=()=>alert('无权限访问此目录（请在应用设置 → 授权目录中授予读写权限）')}else if(e.is_dir){b.onclick=()=>openBrowser(e.path)}else{b.style.opacity='0.5'}lst.appendChild(b)});m.style.display='flex'}catch(e){alert('浏览目录失败: '+e.message)}}
 function openBrowserFromInput(){let p=(el('browser_path_input').value||'').trim();if(!p){alert('请输入完整路径');return}openBrowser(p)}
 function selectDir(){el('monitor_dir').value=browsePath;el('modal').style.display='none';saveCfg()}
-refresh();setInterval(refresh,5000)</script>
+async function loadProblems(){try{let d=await fetch('/api/problems').then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});let lst=(d.problems||[]).filter(p=>p.exists);let ne=el('prob_empty'),wr=el('prob_wrap'),tb=el('prob_tb');if(!ne||!wr||!tb)return;if(!lst.length){ne.style.display='';wr.style.display='none';return}ne.style.display='none';wr.style.display='';tb.innerHTML='';lst.forEach(p=>{let tr=document.createElement('tr');let td1=document.createElement('td');td1.textContent=p.filepath;td1.style.wordBreak='break-all';tr.appendChild(td1);let td2=document.createElement('td');td2.textContent=p.reason||'转码失败';td2.className='err';tr.appendChild(td2);let td3=document.createElement('td');td3.textContent=p.failure_count;tr.appendChild(td3);let td4=document.createElement('td');td4.textContent=p.file_size_mb;tr.appendChild(td4);let td5=document.createElement('td');td5.style.whiteSpace='nowrap';let rb=document.createElement('button');rb.textContent='重新检测';rb.className='btn bt1';rb.style.cssText='padding:4px 10px;font-size:12px;margin-right:6px';rb.onclick=()=>probRecheck(p.filepath);td5.appendChild(rb);let db2=document.createElement('button');db2.textContent='删除文件';db2.className='btn bt3';db2.style.cssText='padding:4px 10px;font-size:12px';db2.onclick=()=>probDelete(p.filepath);td5.appendChild(db2);tr.appendChild(td5);tb.appendChild(tr)})}catch(e){console.error('loadProblems error:',e)}}
+function probRecheck(fp){fetch('/api/problems/recheck',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filepath:fp})}).then(r=>r.json()).then(d=>{if(d.success){alert('已从问题列表移除，将在下次扫描重新检测');loadProblems()}else{alert(d.error||'操作失败')}}).catch(e=>alert('操作失败: '+e.message))}
+function probDelete(fp){if(!confirm('确定要永久删除该文件吗？\\n\\n'+fp+'\\n\\n此操作不可恢复，请确认该文件已损坏且无需保留！'))return;fetch('/api/problems/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filepath:fp})}).then(r=>r.json()).then(d=>{if(d.success){alert('文件已删除');loadProblems()}else{alert(d.error||'删除失败')}}).catch(e=>alert('删除失败: '+e.message))}
+refresh();setInterval(refresh,5000);loadProblems()</script>
 <div id="modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:999;align-items:center;justify-content:center"><div style="background:#fff;border-radius:12px;width:90%;max-width:560px;max-height:70vh;display:flex;flex-direction:column"><div style="padding:16px 20px;border-bottom:1px solid #e5e7eb"><div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><span id="bpath" style="font-weight:600;font-size:14px;word-break:break-all">/</span><div><button class="btn bt2" style="padding:6px 14px;font-size:13px" onclick="selectDir()">选择此目录</button><button class="btn bt3" style="padding:6px 14px;font-size:13px;margin-left:6px" onclick="el('modal').style.display='none'">关闭</button></div></div><div style="display:flex;gap:8px;margin-top:10px"><input id="browser_path_input" type="text" placeholder="可直接输入授权目录，如 /vol3/1000/PORN"><button class="btn bt1" style="padding:8px 12px;white-space:nowrap" onclick="openBrowserFromInput()">打开路径</button></div></div><div id="blist" style="overflow-y:auto;flex:1;padding:8px 12px"></div></div></div>
 <style>.bitem{padding:10px 12px;cursor:pointer;border-radius:6px;font-size:14px;color:#1f2937}.bitem:hover{background:#f3f4f6}</style></body></html>'''
 
