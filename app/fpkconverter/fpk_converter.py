@@ -12,7 +12,7 @@ import hashlib
 import re
 from pathlib import Path
 
-VERSION = '1.0.54'
+VERSION = '1.0.55'
 
 
 class Database:
@@ -88,6 +88,27 @@ class Database:
             print(f"数据库查询失败: {e}")
             return False
 
+    def is_file_processed_or_problem(self, filepath):
+        """单连接同时检查：已成功转码 或 已判定问题文件。返回 (skip, is_processed)。
+        供高频扫描路径使用，避免每个文件开两个数据库连接。"""
+        fp = str(filepath)
+        try:
+            conn = self._get_connection()
+            try:
+                cursor = conn.cursor()
+                cursor.execute('SELECT 1 FROM processed_files WHERE filepath = ? AND success = 1', (fp,))
+                if cursor.fetchone():
+                    return True, True
+                cursor.execute('SELECT 1 FROM problem_files WHERE filepath = ?', (fp,))
+                if cursor.fetchone():
+                    return True, False
+                return False, False
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"数据库查询失败: {e}")
+            return False, False
+
     def add_processed_file(self, filepath, file_size, success, saved_size=0):
         try:
             conn = self._get_connection()
@@ -148,21 +169,21 @@ class Database:
             print(f"数据库清理失败: {e}")
             return removed
 
-    def record_problem_file(self, filepath, reason='', file_size=0):
-        """记录一个判定为损坏/永久转码失败的问题文件"""
+    def record_problem_file(self, filepath, reason='', file_size=0, failure_count=1):
+        """记录一个判定为损坏/永久转码失败的问题文件；failure_count 累计总失败次数"""
         try:
             conn = self._get_connection()
             try:
                 cursor = conn.cursor()
                 cursor.execute('''
                     INSERT INTO problem_files (filepath, reason, last_attempt_at, failure_count, file_size)
-                    VALUES (?, ?, CURRENT_TIMESTAMP, 1, ?)
+                    VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?)
                     ON CONFLICT(filepath) DO UPDATE SET
                         reason = excluded.reason,
                         last_attempt_at = CURRENT_TIMESTAMP,
-                        failure_count = failure_count + 1,
+                        failure_count = failure_count + excluded.failure_count,
                         file_size = excluded.file_size
-                ''', (str(filepath), reason, int(file_size or 0)))
+                ''', (str(filepath), reason, int(failure_count or 1), int(file_size or 0)))
                 conn.commit()
             finally:
                 conn.close()
@@ -316,6 +337,11 @@ class VideoConverter:
                 return True, 0, ''
             failures = int(state.get('failures', 0))
             if failures >= self.MAX_FAILURE_RETRIES:
+                # 数据库已不再标记为问题文件（用户在 UI 点了"重新检测"），
+                # 或问题记录写入失败：重置内存状态，允许重新尝试
+                if self.db and hasattr(self.db, 'is_problem_file') and not self.db.is_problem_file(filepath_str):
+                    self.failure_retry_state.pop(filepath_str, None)
+                    return True, 0, ''
                 return False, 0, f'已失败 {self.MAX_FAILURE_RETRIES} 次，停止自动重试'
             next_retry_at = float(state.get('next_retry_at', 0))
             now = self._now()
@@ -338,7 +364,7 @@ class VideoConverter:
                 except Exception:
                     size = 0
                 if self.db:
-                    self.db.record_problem_file(filepath_str, reason or '转码失败', size)
+                    self.db.record_problem_file(filepath_str, reason or '转码失败', size, failure_count=failures)
                 print(f"转码失败已达到 {self.MAX_FAILURE_RETRIES} 次，停止自动重试，已加入问题文件列表: {filepath_str}")
                 return None
             delay = self.FAILURE_RETRY_DELAYS[min(failures - 1, len(self.FAILURE_RETRY_DELAYS) - 1)]
@@ -689,13 +715,17 @@ class VideoConverter:
         
         filepath_str = str(filepath)
         
-        # 入队前检查数据库：已成功转码的文件直接跳过，避免无意义的 300 秒等待
-        if self.db.is_file_processed(filepath_str):
-            return
-
-        # 已判定的问题/损坏文件（达重试上限）静默跳过，避免每次扫描刷一行日志
-        if self.db.is_problem_file(filepath_str):
-            return
+        # 单连接同时检查：已成功转码的文件跳过（避免无意义 300 秒等待），
+        # 已判定的问题/损坏文件（达重试上限）静默跳过（避免每次扫描刷日志）
+        if hasattr(self.db, 'is_file_processed_or_problem'):
+            skip, _processed = self.db.is_file_processed_or_problem(filepath_str)
+            if skip:
+                return
+        else:
+            if self.db.is_file_processed(filepath_str):
+                return
+            if self.db.is_problem_file(filepath_str):
+                return
 
         allowed, remaining, reason = self._can_attempt_file(filepath_str)
         if not allowed:
@@ -925,9 +955,12 @@ class VideoConverter:
         except Exception as e:
             print(f"转码过程异常: {e}")
             traceback.print_exc()
+            self._last_failure_reason = f'转码过程异常: {e}'
             return False, 0
 
     def _convert_video_impl(self, input_path):
+        # 每次转码前重置失败原因，避免携带上一个文件的陈旧原因写入问题文件表
+        self._last_failure_reason = '转码失败'
         input_path = Path(input_path)
         if not self.is_video_file(input_path):
             print(f"非视频文件，跳过: {input_path}")
@@ -1097,6 +1130,7 @@ class VideoConverter:
                     return False, 0
         except subprocess.TimeoutExpired:
             print(f"FFmpeg 转码超时(1小时): {input_path}")
+            self._last_failure_reason = '转码超时（1 小时未完成）'
             self.db.add_processed_file(input_path, original_size, False)
             if output_path.exists():
                 try: output_path.unlink()
@@ -1104,11 +1138,13 @@ class VideoConverter:
             return False, 0
         except FileNotFoundError:
             print("ffmpeg 未安装或不在 PATH 中")
+            self._last_failure_reason = 'ffmpeg 不可用'
             self.db.add_processed_file(input_path, original_size, False)
             return False, 0
         except Exception as e:
             print(f"转码失败: {e}")
             traceback.print_exc()
+            self._last_failure_reason = f'转码异常: {e}'
             self.db.add_processed_file(input_path, original_size, False)
             if output_path.exists():
                 try: output_path.unlink()
@@ -1117,6 +1153,7 @@ class VideoConverter:
 
         converted_size = self.get_file_size(output_path)
         if converted_size is None or converted_size == 0:
+            self._last_failure_reason = '转码输出为空（源文件可能损坏或临时目录空间不足）'
             if output_path.exists():
                 try: output_path.unlink()
                 except: pass
@@ -1145,6 +1182,7 @@ class VideoConverter:
                     input_path = backup_path  # 后续删除的是备份
                 except Exception as e:
                     print(f"备份原文件失败: {e}")
+                    self._last_failure_reason = '备份原文件失败'
                     if output_path.exists():
                         try: output_path.unlink()
                         except: pass
@@ -1158,6 +1196,7 @@ class VideoConverter:
                 shutil.move(str(output_path), str(final_output_path))
             except Exception as e:
                 print(f"移动输出文件失败: {e}")
+                self._last_failure_reason = '移动输出文件失败（跨设备移动或权限问题）'
                 # 尝试恢复备份
                 if backup_path and backup_path.exists():
                     try:
