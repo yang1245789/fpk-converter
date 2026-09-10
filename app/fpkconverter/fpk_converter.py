@@ -12,7 +12,7 @@ import hashlib
 import re
 from pathlib import Path
 
-VERSION = '1.0.55'
+VERSION = '1.0.56'
 
 
 class Database:
@@ -296,6 +296,10 @@ class VideoConverter:
         self.failure_lock = threading.Lock()
         self._qsv_disabled = False
         self._last_failure_reason = '转码失败'
+        # 分辨率策略：keep(保持原分辨率) / 1080p(默认,兼容旧行为) / custom(自定义 ffmpeg -vf 滤镜)
+        self.resize_mode = '1080p'
+        # custom 模式下用户填写的 ffmpeg 滤镜参数（仅允许安全白名单，防命令注入）
+        self.custom_resize = ''
 
     def _now(self):
         return time.time()
@@ -861,6 +865,33 @@ class VideoConverter:
         safe_stem = safe_stem[:60].rstrip('._-') or 'video'
         return f"{safe_stem}_{digest}"
 
+    # 自定义 scale ／滤镜参数白名单。
+    # 仅允许有限的滤镜写法，出现 shell 元字符或路径访问一律拒绝，防止命令注入。
+    # 允许示例：-2:1080 / 1920:-2 / -2:720 / 1280x720 / scale=1920:-2
+    CUSTOM_RESIZE_RE = re.compile(
+        r'^(?:[1-9]\d{1,4}|-2):(?:[1-9]\d{1,4}|-2)$'
+        r'|^(?:[1-9]\d{1,4}|-2)x(?:[1-9]\d{1,4}|-2)$'
+        r'|^scale=[-0-9:]+,?[-0-9:,=]*$'
+    )
+
+    def _validate_custom_resize(self, raw):
+        """校验自定义分辨率参数。返回 (normalized_or_None, error)。
+        放行：W:H 、WxH 或 scale=... 形式的纯数值滤镜；拒绝含 shell 元字符、路径、分号、管道等。"""
+        if raw is None:
+            return None, ''
+        s = str(raw).strip()
+        if not s:
+            return None, ''
+        # 拒绝任何可能触发注入的字符
+        if any(c in s for c in (';', '|', '&', '`', '$', '<', '>', '(', ')', '\n', '\r', "'", '"', '\\', '/')):
+            return None, '自定义分辨率参数含非法字符，已拒绝'
+        s = s.replace(' -vf ', ' ').replace('-vf ', '')  # 容忍用户误带 -vf 前缀
+        if not self.CUSTOM_RESIZE_RE.match(s):
+            return None, '自定义分辨率参数格式非法（示例：-2:1080 或 1920x-2 或 scale=-2:1080）'
+        if s.startswith('scale=') and s.endswith(','):
+            s = s.rstrip(',')
+        return s, ''
+
     def _build_ffmpeg_cmd(self, input_path, output_path, target_codec, target_width, target_height, needs_resize,
                           preset_override=None, progress=False, qsv_device=None, color_info=None):
         is_qsv = target_codec.endswith('_qsv')
@@ -883,7 +914,14 @@ class VideoConverter:
         cmd.extend(['-threads', str(self.threads)])
 
         if needs_resize:
-            cmd.extend(['-vf', f'scale={target_width}:{target_height}'])
+            if hasattr(self, 'resize_mode') and self.resize_mode == 'custom' and self.custom_resize:
+                # custom 已由 _validate_custom_resize 校验，直接作为 scale 目标
+                if self.custom_resize.startswith('scale='):
+                    cmd.extend(['-vf', self.custom_resize])
+                else:
+                    cmd.extend(['-vf', f'scale={self.custom_resize}'])
+            else:
+                cmd.extend(['-vf', f'scale={target_width}:{target_height}'])
 
         color_info = color_info or {}
         color_arg_map = (
@@ -1021,8 +1059,21 @@ class VideoConverter:
         
         target_width, target_height = width, height
         needs_resize = False
-        
-        if height > 1080:
+        resize_mode = getattr(self, 'resize_mode', '1080p') or '1080p'
+
+        if resize_mode == 'keep':
+            # 保持原分辨率，不缩放
+            needs_resize = False
+        elif resize_mode == 'custom':
+            # 自定义：校验后使用用户填写的参数作为缩放目标
+            custom, verr = self._validate_custom_resize(self.custom_resize)
+            if verr:
+                print(f"自定义分辨率参数无效，按原分辨率处理: {verr}")
+                needs_resize = False
+            elif custom:
+                self.custom_resize = custom  # 归一化后的值
+                needs_resize = True
+        elif resize_mode == '1080p' and height > 1080:
             target_height = 1080
             target_width = int(width * 1080 / height)
             target_width = target_width - (target_width % 2)

@@ -45,12 +45,14 @@ def add_headers(r):
     r.headers['X-Content-Type-Options'] = 'nosniff'
     return r
 
-ALLOWED = {'monitor_dir','crf','codec','container','preset','threads','use_gpu','enabled'}
+ALLOWED = {'monitor_dir','monitor_dirs','crf','codec','container','preset','threads','use_gpu','resize_mode','custom_resize','enabled'}
 CODECS = ('libx264','libx265')
 CONTAINERS = ('mp4','mkv')
 PRESETS = ('ultrafast','superfast','veryfast','faster','fast','medium','slow','slower','veryslow')
-DEFAULT = {'monitor_dir':'','crf':23,'codec':'libx264','container':'mp4',
-           'preset':'medium','threads':1,'use_gpu':True,'enabled':False}
+RESIZE_MODES = ('keep','1080p','custom')
+DEFAULT = {'monitor_dir':'','monitor_dirs':[],'crf':23,'codec':'libx264','container':'mp4',
+           'preset':'medium','threads':1,'use_gpu':True,'resize_mode':'1080p','custom_resize':'',
+           'enabled':False}
 MIN_CRF = 18
 MAX_CRF = 32
 MAX_THREADS = 4
@@ -94,16 +96,43 @@ def _rotate_log_if_needed(path, max_bytes=None, backup_count=None):
             pass
         return False
 
+def _normalize_monitor_dirs(cfg_data):
+    """将配置归一化：monitor_dirs 为去重、保留顺序的授权目录列表；
+    monitor_dir 始终等于列表第一个（方便旧版单值读取）。"""
+    dirs = cfg_data.get('monitor_dirs')
+    if not isinstance(dirs, list):
+        # 旧版只有 monitor_dir：迁移为单元素列表
+        single = str(cfg_data.get('monitor_dir') or '').strip()
+        dirs = [single] if single else []
+    seen, ordered = set(), []
+    for d in dirs:
+        d = str(d or '').strip().rstrip('/')
+        if d and d not in seen:
+            seen.add(d)
+            ordered.append(d)
+    return ordered
+
+def _sync_monitor_aliases():
+    """保持 monitor_dir 与 monitor_dirs 同步，返回首个目录。"""
+    dirs = _normalize_monitor_dirs(cfg)
+    cfg['monitor_dirs'] = dirs
+    cfg['monitor_dir'] = dirs[0] if dirs else ''
+    return cfg['monitor_dir']
+
 def load_cfg():
     global cfg
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH) as f: d = json.load(f)
-            if isinstance(d, dict): cfg = {**DEFAULT, **{k:v for k,v in d.items() if k in ALLOWED}}
+            if isinstance(d, dict):
+                cfg = {**DEFAULT, **{k:v for k,v in d.items() if k in ALLOWED}}
+                cfg['monitor_dirs'] = _normalize_monitor_dirs({**d, **cfg})
+                cfg['monitor_dir'] = cfg['monitor_dirs'][0] if cfg['monitor_dirs'] else ''
         except: pass
 
 def save_cfg():
     try:
+        _sync_monitor_aliases()
         t = CONFIG_PATH + '.tmp'
         with open(t,'w') as f: json.dump(cfg, f, indent=2)
         os.replace(t, CONFIG_PATH)
@@ -358,7 +387,9 @@ def _process_snapshot():
     }, lines
 
 @app.route('/')
-def index(): return render_template_string(HTML, config=cfg, var_dir=VAR_DIR, conv_log=CONV_LOG, db_path=DB_PATH)
+def index():
+    _sync_monitor_aliases()
+    return render_template_string(HTML, config=cfg, var_dir=VAR_DIR, conv_log=CONV_LOG, db_path=DB_PATH)
 
 @app.route('/api/config', methods=['GET','POST'])
 def api_cfg():
@@ -371,19 +402,41 @@ def api_cfg():
                 vs, err = _validate_user_directory(v, must_exist=False)
                 if not vs:
                     return jsonify({'success':False, 'error':err}), 400
-                cfg[k] = vs
+                cfg['monitor_dir'] = vs
+                # 兼容旧版单值行为：把 monitor_dir 同步进 monitor_dirs
+                dirs = list(cfg.get('monitor_dirs') or [])
+                if vs not in dirs:
+                    dirs.append(vs)
+                cfg['monitor_dirs'] = dirs
+                _sync_monitor_aliases()
+            elif k == 'monitor_dirs':
+                # 多目录：逐项校验并过滤无效项
+                new_dirs = []
+                for item in (v if isinstance(v, list) else []):
+                    vs, err = _validate_user_directory(item, must_exist=False)
+                    if vs and vs not in new_dirs:
+                        new_dirs.append(vs)
+                if any(not _validate_user_directory(item, must_exist=False)[0] for item in (v if isinstance(v, list) else [])):
+                    return jsonify({'success':False, 'error':'存在未授权或非法的监控目录'}), 400
+                cfg['monitor_dirs'] = new_dirs
+                _sync_monitor_aliases()
             elif k == 'crf':
                 try: cfg[k] = max(MIN_CRF, min(MAX_CRF, int(v)))
                 except: pass
             elif k == 'codec' and v in CODECS: cfg[k] = v
             elif k == 'container' and v in CONTAINERS: cfg[k] = v
             elif k == 'preset' and v in PRESETS: cfg[k] = v
+            elif k == 'resize_mode' and v in RESIZE_MODES: cfg[k] = v
+            elif k == 'custom_resize':
+                cfg[k] = str(v or '').strip()
             elif k == 'threads':
                 try: cfg[k] = max(1, min(MAX_THREADS, int(v)))
                 except: pass
             elif k == 'use_gpu': cfg[k] = bool(v)
         save_cfg()
+        _sync_monitor_aliases()
         return jsonify({'success':True, 'config':cfg})
+    _sync_monitor_aliases()
     return jsonify(cfg)
 
 @app.route('/api/status')
@@ -404,24 +457,30 @@ def api_start():
     last_error = ''
     if _is_running():
         return jsonify({'success':False, 'error':'已在运行中'})
-    md = cfg.get('monitor_dir','')
-    if not md:
-        last_error = '请先选择监控文件夹'
+    _sync_monitor_aliases()
+    dirs = cfg.get('monitor_dirs') or []
+    if not dirs:
+        last_error = '请至少选择一个监控文件夹'
         return jsonify({'success':False, 'error':last_error})
-    md, err = _validate_user_directory(md, must_exist=True)
-    if not md:
-        last_error = err
-        return jsonify({'success':False, 'error':last_error})
+    # 逐目录校验必须存在
+    validated_dirs = []
+    for md in dirs:
+        md, err = _validate_user_directory(md, must_exist=True)
+        if not md:
+            last_error = err
+            return jsonify({'success':False, 'error':last_error})
+        validated_dirs.append(md)
     os.makedirs(TEMP_DIR, exist_ok=True)
     jp = os.path.join(VAR_DIR, 'start_config.json')
     with open(jp,'w') as f: json.dump({
-        'db_path':DB_PATH, 'code_dir':SCRIPT_DIR, 'monitor_dir':md,
+        'db_path':DB_PATH, 'code_dir':SCRIPT_DIR, 'monitor_dirs':validated_dirs,
         'crf':cfg.get('crf',23), 'codec':cfg.get('codec','libx264'),
         'container':cfg.get('container','mp4'), 'preset':cfg.get('preset','medium'),
         'threads':cfg.get('threads',1), 'use_gpu':cfg.get('use_gpu',True),
+        'resize_mode':cfg.get('resize_mode','1080p'), 'custom_resize':cfg.get('custom_resize',''),
         'temp_dir': TEMP_DIR, 'max_depth': 5}, f)
     sc = os.path.join(VAR_DIR, 'start_converter.py')
-    script_content = '''import sys,os,json,subprocess,traceback
+    script_content = '''import sys,os,json,subprocess,traceback,time
 sd=os.path.dirname(os.path.abspath(__file__))
 print("=== 转码进程启动 ===")
 print(f"Python: {sys.executable}")
@@ -464,14 +523,34 @@ if td:
     os.makedirs(td,exist_ok=True)
     print(f"temp_dir 可写: {os.access(td, os.W_OK)}")
 vc=fpkc.VideoConverter(db,c["crf"],c["codec"],c["container"],c["preset"],c["threads"],c["use_gpu"],temp_dir=td if td else None)
-print(f"编码器: {vc.codec}, GPU: {vc.use_gpu}")
-ok,msg=vc.preflight_check(c["monitor_dir"])
+# 透传分辨率策略与自定义 ffmpeg 参数到转码核心
+vc.resize_mode=c.get("resize_mode","1080p")
+vc.custom_resize=c.get("custom_resize","")
+print(f"编码器: {vc.codec}, GPU: {vc.use_gpu}, 分辨率策略: {vc.resize_mode}, 自定义: {vc.custom_resize!r}")
+dirs=c.get("monitor_dirs") or ([c["monitor_dir"]] if c.get("monitor_dir") else [])
+if not dirs:
+    print("未配置任何监控目录，退出")
+    sys.exit(2)
+ok,msg=vc.preflight_check(dirs[0])
 print(f"启动前功能自检结果: {msg}")
 if not ok:
     print("启动前功能自检失败，停止进入正式转码流程")
     sys.exit(2)
-print("启动前功能自检通过，进入正式扫描流程")
-fpkc.FolderScanner(c["monitor_dir"],vc,max_depth=c.get("max_depth",3)).start()
+print(f"启动前功能自检通过，进入正式扫描流程，共 {len(dirs)} 个监控目录")
+import threading as _th
+scanners=[]
+def _run_scanner(d):
+    fpkc.FolderScanner(d,vc,max_depth=c.get("max_depth",3)).start()
+for d in dirs:
+    t=_th.Thread(target=_run_scanner,args=(d,),daemon=True)
+    t.start()
+    scanners.append(t)
+# 主线程等待，保持进程存活
+try:
+    while True:
+        time.sleep(5)
+except (KeyboardInterrupt, SystemExit):
+    pass
 '''
     with open(sc, 'w') as f:
         f.write(script_content)
@@ -545,22 +624,40 @@ def api_stop():
 
 @app.route('/api/logs')
 def api_logs():
+    # 统计(全量聚合)与明细列表(仅最近100条)分离：
+    # 修复此前"统计只算最近100条"导致的不准确显示。
+    stats = {'total_count': 0, 'success_count': 0, 'total_saved_mb': 0.0, 'total_processed_mb': 0.0}
     rows = []
     try:
-        db = sqlite3.connect(DB_PATH)
+        db = sqlite3.connect(DB_PATH, timeout=5)
         try:
+            agg = db.execute(
+                'SELECT COUNT(*), '
+                '       COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0), '
+                '       COALESCE(SUM(saved_size), 0), '
+                '       COALESCE(SUM(file_size), 0) '
+                'FROM processed_files'
+            ).fetchone()
+            if agg:
+                stats['total_count'] = int(agg[0] or 0)
+                stats['success_count'] = int(agg[1] or 0)
+                stats['total_saved_mb'] = round((agg[2] or 0) / 1048576, 2)
+                stats['total_processed_mb'] = round((agg[3] or 0) / 1048576, 2)
             rows = db.execute('SELECT * FROM processed_files ORDER BY processed_at DESC LIMIT 100').fetchall()
         finally:
             db.close()
     except: pass
-    logs, total = [], 0
+    logs = []
     for r in rows:
         logs.append({'id':r[0],'filepath':str(r[1]),'file_size':r[2],
             'file_size_mb':round(r[2]/1048576,2),'processed_at':str(r[3]),
             'success':bool(r[4]),'saved_size':r[5] or 0,
             'saved_size_mb':round((r[5] or 0)/1048576,2)})
-        total += r[5] or 0
-    return jsonify({'logs':logs,'total_saved_mb':round(total/1048576,2)})
+    return jsonify({'logs':logs,
+                    'total_saved_mb':stats['total_saved_mb'],
+                    'total_count':stats['total_count'],
+                    'success_count':stats['success_count'],
+                    'total_processed_mb':stats['total_processed_mb']})
 
 @app.route('/api/problems')
 def api_problems():
@@ -733,7 +830,12 @@ HTML = '''<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <div style="margin-top:12px"><div class="kl">最近转码输出</div><pre class="logbox" id="recent_log">暂无日志</pre></div>
 </div>
 <div class="s"><div class="st">配置</div>
-<div class="fg"><label>监控文件夹</label><div style="display:flex;gap:8px"><input type="text" id="monitor_dir" value="{{config.monitor_dir}}" placeholder="点击浏览选择目录"><button class="btn bt1" style="padding:9px 14px;white-space:nowrap" onclick="openBrowser()">浏览</button></div></div>
+<div class="fg"><label>监控文件夹（可添加多个）</label>
+<div id="dirs_list" class="dirs_list"></div>
+<div style="display:flex;gap:8px"><input type="text" id="monitor_dir" value="{{config.monitor_dir}}" placeholder="点击浏览或直接输入授权目录"><button class="btn bt1" style="padding:9px 14px;white-space:nowrap" onclick="openBrowser()">浏览</button><button class="btn bt2" style="padding:9px 14px;white-space:nowrap" onclick="addDir()">添加</button></div>
+<div class="info">点击"添加"将该目录加入监控列表；每轮扫描一次，可同时监控多个目录。</div></div>
+<div class="fg"><label>分辨率策略</label><select id="resize_mode" onchange="toggleResizeCustom()"><option value="1080p" {%if config.resize_mode=="1080p"%}selected{%endif%}>缩放至 1080p（高清）</option><option value="keep" {%if config.resize_mode=="keep"%}selected{%endif%}>保持原分辨率</option><option value="custom" {%if config.resize_mode=="custom"%}selected{%endif%}>自定义</option></select></div>
+<div class="fg" id="custom_resize_wrap" style="display:none"><label>自定义分辨率参数（示例：<code>-2:1080</code>、<code>1920:-2</code> 或 <code>scale=-2:1080</code>；仅支持 scale，禁止特殊字符）</label><input type="text" id="custom_resize" value="{{config.custom_resize}}" placeholder="如 -2:1080"></div>
 <div class="fg"><label>CRF (18-32, 越小质量越高；已限制最低 18 防止过载)</label><input type="number" id="crf" min="18" max="32" value="{{config.crf}}"></div>
 <div class="fg"><label>编码预设 (越慢越省空间)</label><select id="preset">{% for p in ['ultrafast','superfast','veryfast','faster','fast','medium','slow','slower','veryslow'] %}<option value="{{p}}" {%if p==config.preset%}selected{%endif%}>{{p}}</option>{%endfor%}</select></div>
 <div class="fg"><label>线程数 (最多 4，保护系统负载)</label><input type="number" id="threads" min="1" max="4" value="{{config.threads}}"></div>
@@ -751,19 +853,24 @@ HTML = '''<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <div class="s"><div class="st">转码日志</div><div class="tc"><table><thead><tr><th>文件</th><th>原大小</th><th>节省</th><th>状态</th><th>时间</th></tr></thead><tbody id="tb"></tbody></table></div></div></div></div>
 <script>
 function api(a){fetch('/api/'+a,{method:'POST'}).then(r=>{if(!r.ok)throw new Error(r.status);return r.json()}).then(d=>{if(d.error){el('errmsg').textContent=d.error;el('errmsg').style.display='block'}else{el('errmsg').style.display='none'}refresh()}).catch(e=>{el('errmsg').textContent='请求失败: '+e.message;el('errmsg').style.display='block'})}
-function saveCfg(){let d={monitor_dir:el('monitor_dir').value,crf:parseInt(el('crf').value),preset:el('preset').value,threads:parseInt(el('threads').value),codec:el('codec').value,container:el('container').value,use_gpu:el('use_gpu').checked};fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>{if(!r.ok)throw new Error(r.status);return r.json()}).then(d=>{if(d.success)alert('已保存');else alert('保存失败')}).catch(e=>alert('保存失败: '+e.message))}
-async function refresh(){try{let s=await fetch('/api/status').then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});let b=el('badge');b.textContent=s.running?'运行中':'已停止';b.className='badge '+(s.running?'bg':'br');s.config&&(el('monitor_dir').value=s.config.monitor_dir,el('crf').value=s.config.crf,el('preset').value=s.config.preset,el('threads').value=s.config.threads,el('codec').value=s.config.codec,el('container').value=s.config.container,el('use_gpu').checked=s.config.use_gpu!==false);let p=s.process||{};el('process_pid').textContent=p.pid||'-';el('process_uptime').textContent=p.uptime_seconds!=null?(p.uptime_seconds+' 秒'):'-';el('current_file').textContent=p.current_file||'-';el('current_activity').textContent=p.current_activity||'-';let pct=Math.max(0,Math.min(100,Number(p.progress_percent||0)));el('progress_fill').style.width=pct+'%';el('progress_text').textContent=pct.toFixed(1)+'%';el('last_error_text').textContent=s.error||p.last_error||'无';el('recent_log').textContent=(s.recent_log&&s.recent_log.length)?s.recent_log.join('\\n'):'暂无日志';let l=await fetch('/api/logs').then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});el('ts').textContent=l.total_saved_mb;el('tc2').textContent=l.logs.length;let t=el('tb');t.innerHTML='';l.logs.forEach(r=>{let tr=document.createElement('tr');['filepath','file_size_mb','saved_size_mb'].forEach(k=>{let td=document.createElement('td');td.textContent=r[k];tr.appendChild(td)});let sd=document.createElement('td');sd.textContent=r.success?'成功':'失败';sd.className=r.success?'suc':'err';tr.appendChild(sd);let td=document.createElement('td');td.textContent=r.processed_at;tr.appendChild(td);t.appendChild(tr)})}catch(e){console.error('refresh error:',e)}}
+var monitorDirs=({{config.monitor_dirs|tojson}}||[]);
+function addDir(){let v=(el('monitor_dir').value||'').trim();if(!v){alert('请输入目录路径');return}v=v.replace(/\/+$/,'');if(monitorDirs.indexOf(v)<0){monitorDirs.push(v);renderDirs();saveCfg()}else{alert('该目录已在列表中')}}
+function removeDir(i){monitorDirs.splice(i,1);renderDirs();saveCfg()}
+function renderDirs(){let L=el('dirs_list');L.innerHTML='';if(!monitorDirs.length){L.innerHTML='<div class="info" style="margin-bottom:6px">尚未添加任何监控目录</div>';return}monitorDirs.forEach((d,i)=>{let w=document.createElement('div');w.className='dir_item';let sp=document.createElement('span');sp.textContent=d;sp.style.wordBreak='break-all';let rm=document.createElement('button');rm.textContent='删除';rm.className='btn bt3';rm.style.cssText='padding:3px 10px;font-size:12px;flex-shrink:0';rm.onclick=()=>removeDir(i);w.appendChild(sp);w.appendChild(rm);L.appendChild(w)})}
+function toggleResizeCustom(){let m=el('resize_mode').value;el('custom_resize_wrap').style.display=(m==='custom')?'block':'none'}
+function saveCfg(){let d={monitor_dirs:monitorDirs,crf:parseInt(el('crf').value),preset:el('preset').value,threads:parseInt(el('threads').value),codec:el('codec').value,container:el('container').value,use_gpu:el('use_gpu').checked,resize_mode:el('resize_mode').value,custom_resize:el('custom_resize').value};fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>{if(!r.ok)throw new Error(r.status);return r.json()}).then(d=>{if(d.success)alert('已保存');else alert('保存失败')}).catch(e=>alert('保存失败: '+e.message))}
+async function refresh(){try{let s=await fetch('/api/status').then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});let b=el('badge');b.textContent=s.running?'运行中':'已停止';b.className='badge '+(s.running?'bg':'br');s.config&&(el('monitor_dir').value=s.config.monitor_dir,el('crf').value=s.config.crf,el('preset').value=s.config.preset,el('threads').value=s.config.threads,el('codec').value=s.config.codec,el('container').value=s.config.container,el('use_gpu').checked=s.config.use_gpu!==false,el('resize_mode').value=s.config.resize_mode||'1080p',el('custom_resize').value=s.config.custom_resize||'');if(s.config&&s.config.monitor_dirs){let nd=(s.config.monitor_dirs||[]).filter(x=>x);if(nd.join('|')!==monitorDirs.join('|')){monitorDirs=nd;renderDirs()}}toggleResizeCustom();let p=s.process||{};el('process_pid').textContent=p.pid||'-';el('process_uptime').textContent=p.uptime_seconds!=null?(p.uptime_seconds+' 秒'):'-';el('current_file').textContent=p.current_file||'-';el('current_activity').textContent=p.current_activity||'-';let pct=Math.max(0,Math.min(100,Number(p.progress_percent||0)));el('progress_fill').style.width=pct+'%';el('progress_text').textContent=pct.toFixed(1)+'%';el('last_error_text').textContent=s.error||p.last_error||'无';el('recent_log').textContent=(s.recent_log&&s.recent_log.length)?s.recent_log.join('\\n'):'暂无日志';let l=await fetch('/api/logs').then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});el('ts').textContent=l.total_saved_mb;el('tc2').textContent=l.total_count!=null?l.total_count:l.logs.length;let t=el('tb');t.innerHTML='';l.logs.forEach(r=>{let tr=document.createElement('tr');['filepath','file_size_mb','saved_size_mb'].forEach(k=>{let td=document.createElement('td');td.textContent=r[k];tr.appendChild(td)});let sd=document.createElement('td');sd.textContent=r.success?'成功':'失败';sd.className=r.success?'suc':'err';tr.appendChild(sd);let td=document.createElement('td');td.textContent=r.processed_at;tr.appendChild(td);t.appendChild(tr)})}catch(e){console.error('refresh error:',e)}}
 function el(id){return document.getElementById(id)}
 var browsePath='/';
 async function openBrowser(p){if(p){browsePath=p}else{let v=(el('monitor_dir').value||'').trim();browsePath=v.startsWith('/')?v:'/'}try{let d=await fetch('/api/browse?path='+encodeURIComponent(browsePath)).then(r=>{if(!r.ok)return r.json().then(j=>{throw new Error(j.error||r.status)});return r.json()});if(d.error){alert(d.error);return}let m=el('modal'),lst=el('blist');browsePath=d.path;el('bpath').textContent=d.path;if(el('browser_path_input'))el('browser_path_input').value=d.path;lst.innerHTML='';if(d.message){let tip=document.createElement('div');tip.style.cssText='padding:12px 14px;background:#fef3c7;color:#78350f;border-radius:8px;margin-bottom:10px;white-space:pre-wrap;font-size:13px;line-height:1.5';tip.textContent=d.message;lst.appendChild(tip)}if(d.path!=='/'){let b=document.createElement('div');b.className='bitem';b.textContent='.. 返回上级';b.onclick=()=>openBrowser(d.path.split('/').slice(0,-1).join('/')||'/');lst.appendChild(b)}d.entries.forEach(e=>{let b=document.createElement('div');b.className='bitem';b.textContent=e.name+(e.is_dir?'/':'');if(e.pinned){b.style.fontWeight='600';b.title='已保存的监控目录'}if(e.no_access){b.style.opacity='0.4';b.title='无权限';if(e.is_dir)b.onclick=()=>alert('无权限访问此目录（请在应用设置 → 授权目录中授予读写权限）')}else if(e.is_dir){b.onclick=()=>openBrowser(e.path)}else{b.style.opacity='0.5'}lst.appendChild(b)});m.style.display='flex'}catch(e){alert('浏览目录失败: '+e.message)}}
 function openBrowserFromInput(){let p=(el('browser_path_input').value||'').trim();if(!p){alert('请输入完整路径');return}openBrowser(p)}
-function selectDir(){el('monitor_dir').value=browsePath;el('modal').style.display='none';saveCfg()}
+function selectDir(){let v=(browsePath||'').replace(/\/+$/,'');el('monitor_dir').value=v;el('modal').style.display='none';if(v&&monitorDirs.indexOf(v)<0){monitorDirs.push(v);renderDirs()}saveCfg()}
 async function loadProblems(){try{let d=await fetch('/api/problems').then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});let lst=(d.problems||[]).filter(p=>p.exists);let ne=el('prob_empty'),wr=el('prob_wrap'),tb=el('prob_tb');if(!ne||!wr||!tb)return;if(!lst.length){ne.style.display='';wr.style.display='none';return}ne.style.display='none';wr.style.display='';tb.innerHTML='';lst.forEach(p=>{let tr=document.createElement('tr');let td1=document.createElement('td');td1.textContent=p.filepath;td1.style.wordBreak='break-all';tr.appendChild(td1);let td2=document.createElement('td');td2.textContent=p.reason||'转码失败';td2.className='err';tr.appendChild(td2);let td3=document.createElement('td');td3.textContent=p.failure_count;tr.appendChild(td3);let td4=document.createElement('td');td4.textContent=p.file_size_mb;tr.appendChild(td4);let td5=document.createElement('td');td5.style.whiteSpace='nowrap';let rb=document.createElement('button');rb.textContent='重新检测';rb.className='btn bt1';rb.style.cssText='padding:4px 10px;font-size:12px;margin-right:6px';rb.onclick=()=>probRecheck(p.filepath);td5.appendChild(rb);let db2=document.createElement('button');db2.textContent='删除文件';db2.className='btn bt3';db2.style.cssText='padding:4px 10px;font-size:12px';db2.onclick=()=>probDelete(p.filepath);td5.appendChild(db2);tr.appendChild(td5);tb.appendChild(tr)})}catch(e){console.error('loadProblems error:',e)}}
 function probRecheck(fp){fetch('/api/problems/recheck',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filepath:fp})}).then(r=>r.json()).then(d=>{if(d.success){alert('已从问题列表移除，将在下次扫描重新检测');loadProblems()}else{alert(d.error||'操作失败')}}).catch(e=>alert('操作失败: '+e.message))}
 function probDelete(fp){if(!confirm('确定要永久删除该文件吗？\\n\\n'+fp+'\\n\\n此操作不可恢复，请确认该文件已损坏且无需保留！'))return;fetch('/api/problems/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filepath:fp})}).then(r=>r.json()).then(d=>{if(d.success){alert('文件已删除');loadProblems()}else{alert(d.error||'删除失败')}}).catch(e=>alert('删除失败: '+e.message))}
-refresh();setInterval(refresh,5000);loadProblems()</script>
+renderDirs();toggleResizeCustom();refresh();setInterval(refresh,5000);loadProblems()</script>
 <div id="modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:999;align-items:center;justify-content:center"><div style="background:#fff;border-radius:12px;width:90%;max-width:560px;max-height:70vh;display:flex;flex-direction:column"><div style="padding:16px 20px;border-bottom:1px solid #e5e7eb"><div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><span id="bpath" style="font-weight:600;font-size:14px;word-break:break-all">/</span><div><button class="btn bt2" style="padding:6px 14px;font-size:13px" onclick="selectDir()">选择此目录</button><button class="btn bt3" style="padding:6px 14px;font-size:13px;margin-left:6px" onclick="el('modal').style.display='none'">关闭</button></div></div><div style="display:flex;gap:8px;margin-top:10px"><input id="browser_path_input" type="text" placeholder="可直接输入授权目录，如 /vol3/1000/PORN"><button class="btn bt1" style="padding:8px 12px;white-space:nowrap" onclick="openBrowserFromInput()">打开路径</button></div></div><div id="blist" style="overflow-y:auto;flex:1;padding:8px 12px"></div></div></div>
-<style>.bitem{padding:10px 12px;cursor:pointer;border-radius:6px;font-size:14px;color:#1f2937}.bitem:hover{background:#f3f4f6}</style></body></html>'''
+<style>.bitem{padding:10px 12px;cursor:pointer;border-radius:6px;font-size:14px;color:#1f2937}.bitem:hover{background:#f3f4f6}.dirs_list{margin-bottom:8px}.dir_item{display:flex;justify-content:space-between;align-items:center;gap:8px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;padding:7px 10px;margin-bottom:6px;font-size:13px}.dir_item span{flex:1;color:#1f2937}</style></body></html>'''
 
 if __name__ == '__main__':
     import signal

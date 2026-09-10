@@ -447,7 +447,9 @@ class WebServerFlowTests(unittest.TestCase):
         self.assertIn("监控文件夹", data["error"])
 
     def test_start_button_rejects_system_directory_even_if_config_is_tampered(self):
+        # 即使配置被篡改为系统目录，start 也应拒绝（多目录语义下校验 monitor_dirs）
         self.web.cfg["monitor_dir"] = "/etc"
+        self.web.cfg["monitor_dirs"] = ["/etc"]
 
         response = self.client.post("/api/start")
 
