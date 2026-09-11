@@ -45,14 +45,14 @@ def add_headers(r):
     r.headers['X-Content-Type-Options'] = 'nosniff'
     return r
 
-ALLOWED = {'monitor_dir','monitor_dirs','crf','codec','container','preset','threads','use_gpu','resize_mode','custom_resize','enabled'}
+ALLOWED = {'monitor_dir','monitor_dirs','crf','codec','container','preset','threads','use_gpu','resize_mode','custom_resize','gpu_fallback_cpu','enabled'}
 CODECS = ('libx264','libx265')
 CONTAINERS = ('mp4','mkv')
 PRESETS = ('ultrafast','superfast','veryfast','faster','fast','medium','slow','slower','veryslow')
 RESIZE_MODES = ('keep','1080p','custom')
 DEFAULT = {'monitor_dir':'','monitor_dirs':[],'crf':23,'codec':'libx264','container':'mp4',
            'preset':'medium','threads':1,'use_gpu':True,'resize_mode':'1080p','custom_resize':'',
-           'enabled':False}
+           'gpu_fallback_cpu':False,'enabled':False}
 MIN_CRF = 18
 MAX_CRF = 32
 MAX_THREADS = 4
@@ -433,6 +433,7 @@ def api_cfg():
                 try: cfg[k] = max(1, min(MAX_THREADS, int(v)))
                 except: pass
             elif k == 'use_gpu': cfg[k] = bool(v)
+            elif k == 'gpu_fallback_cpu': cfg[k] = bool(v)
         save_cfg()
         _sync_monitor_aliases()
         return jsonify({'success':True, 'config':cfg})
@@ -478,6 +479,7 @@ def api_start():
         'container':cfg.get('container','mp4'), 'preset':cfg.get('preset','medium'),
         'threads':cfg.get('threads',1), 'use_gpu':cfg.get('use_gpu',True),
         'resize_mode':cfg.get('resize_mode','1080p'), 'custom_resize':cfg.get('custom_resize',''),
+        'gpu_fallback_cpu':cfg.get('gpu_fallback_cpu',False),
         'temp_dir': TEMP_DIR, 'max_depth': 5}, f)
     sc = os.path.join(VAR_DIR, 'start_converter.py')
     script_content = '''import sys,os,json,subprocess,traceback,time
@@ -522,11 +524,11 @@ print(f"temp_dir: {td}")
 if td:
     os.makedirs(td,exist_ok=True)
     print(f"temp_dir 可写: {os.access(td, os.W_OK)}")
-vc=fpkc.VideoConverter(db,c["crf"],c["codec"],c["container"],c["preset"],c["threads"],c["use_gpu"],temp_dir=td if td else None)
+vc=fpkc.VideoConverter(db,c["crf"],c["codec"],c["container"],c["preset"],c["threads"],c["use_gpu"],temp_dir=td if td else None,gpu_fallback_cpu=c.get("gpu_fallback_cpu",False))
 # 透传分辨率策略与自定义 ffmpeg 参数到转码核心
 vc.resize_mode=c.get("resize_mode","1080p")
 vc.custom_resize=c.get("custom_resize","")
-print(f"编码器: {vc.codec}, GPU: {vc.use_gpu}, 分辨率策略: {vc.resize_mode}, 自定义: {vc.custom_resize!r}")
+print(f"编码器: {vc.codec}, GPU: {vc.use_gpu}, GPU降级CPU: {vc.gpu_fallback_cpu}, 分辨率策略: {vc.resize_mode}, 自定义: {vc.custom_resize!r}")
 dirs=c.get("monitor_dirs") or ([c["monitor_dir"]] if c.get("monitor_dir") else [])
 if not dirs:
     print("未配置任何监控目录，退出")
@@ -842,6 +844,7 @@ HTML = '''<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <div class="fg"><label>编码器</label><select id="codec"><option value="libx264" {%if config.codec=="libx264"%}selected{%endif%}>H.264 (兼容性好)</option><option value="libx265" {%if config.codec=="libx265"%}selected{%endif%}>H.265 (更省空间)</option></select></div>
 <div class="fg"><label>格式</label><select id="container"><option value="mp4" {%if config.container=="mp4"%}selected{%endif%}>MP4</option><option value="mkv" {%if config.container=="mkv"%}selected{%endif%}>MKV</option></select></div>
 <div class="fg"><label><input type="checkbox" id="use_gpu" {%if config.use_gpu%}checked{%endif%}> GPU加速 (QSV)</label></div>
+<div class="fg"><label><input type="checkbox" id="gpu_fallback_cpu" {%if config.gpu_fallback_cpu%}checked{%endif%}> GPU不可用时自动降级CPU转码</label><div class="info">开启后，若本机 QSV/GPU 驱动不可用（如 AMD、驱动未装、虚拟机透传等），启动时会自动改用 CPU 转码，避免无法启动。GPU 正常用户可关闭以保持强制 GPU 行为。</div></div>
 <button class="btn bt1" onclick="saveCfg()">保存配置</button>
 <div class="info">日志: {{conv_log}} | 数据库: {{db_path}}</div>
 </div>

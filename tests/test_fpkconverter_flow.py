@@ -919,20 +919,27 @@ class ConverterLogicTests(unittest.TestCase):
     def test_qsv_environment_uses_fnnas_mediasrv_vaapi_stack(self):
         vc = self.converter_module.VideoConverter(self.db, use_gpu=True, temp_dir=str(self.work))
         original_exists = self.converter_module.os.path.exists
+        original_isdir = self.converter_module.os.path.isdir
+        mediasrv_dirs = {"/usr/trim/lib/mediasrv", "/usr/trim/lib/mediasrv/dri"}
 
-        def fake_exists(path):
-            if path in {"/usr/trim/lib/mediasrv", "/usr/trim/lib/mediasrv/dri"}:
+        def fake_member(path):
+            if path in mediasrv_dirs:
                 return True
-            return original_exists(path)
+            return original_isdir(path)
 
-        self.converter_module.os.path.exists = fake_exists
+        self.converter_module.os.path.exists = fake_member
+        self.converter_module.os.path.isdir = fake_member
         try:
+            vc._detect_libva_driver_name = lambda: "iHD"
             env = vc._ffmpeg_env()
         finally:
             self.converter_module.os.path.exists = original_exists
+            self.converter_module.os.path.isdir = original_isdir
 
         self.assertEqual(env["LIBVA_DRIVER_NAME"], "iHD")
-        self.assertEqual(env["LIBVA_DRIVERS_PATH"], "/usr/trim/lib/mediasrv/dri")
+        self.assertIn("/usr/trim/lib/mediasrv/dri", env["LIBVA_DRIVERS_PATH"])
+        # 增强的驱动发现会额外合并系统已有目录，飞牛 mediasrv 目录应排在前面
+        self.assertEqual(env["LIBVA_DRIVERS_PATH"].split(":")[0], "/usr/trim/lib/mediasrv/dri")
         self.assertIn("/usr/trim/lib/mediasrv", env["LD_LIBRARY_PATH"])
 
     def test_gpu_conversion_tries_qsv_device_before_stopping(self):
@@ -1007,6 +1014,147 @@ class ConverterLogicTests(unittest.TestCase):
 
         self.assertFalse(ok)
         self.assertIn("GPU/QSV 自检失败", message)
+
+    def test_preflight_gpu_failure_falls_back_to_cpu_when_enabled(self):
+        """开启 gpu_fallback_cpu 后，QSV 驱动初始化失败应自动降级为 CPU 模式"""
+        vc = self.converter_module.VideoConverter(
+            self.db, use_gpu=True, temp_dir=str(self.work), gpu_fallback_cpu=True)
+        vc._render_devices = lambda: ["/dev/dri/renderD128"]
+
+        def fake_run(cmd, stdout=None, stderr=None, timeout=None, env=None, **kwargs):
+            if "-version" in cmd:
+                return subprocess.CompletedProcess(cmd, 0)
+            if "-f" in cmd and "lavfi" in cmd:
+                return subprocess.CompletedProcess(cmd, 234, stderr=b"iHD_drv_video.so init failed")
+            return subprocess.CompletedProcess(cmd, 0)
+
+        self.converter_module.subprocess.run = fake_run
+
+        ok, message = vc.preflight_check(str(self.work))
+
+        self.assertTrue(ok, message)
+        self.assertFalse(vc.use_gpu)
+        self.assertIn("降级", message)
+
+    def test_preflight_gpu_failure_without_fallback_stops(self):
+        """未开启 gpu_fallback_cpu 时，QSV 自检失败仍应阻止启动（保持原行为）"""
+        vc = self.converter_module.VideoConverter(
+            self.db, use_gpu=True, temp_dir=str(self.work), gpu_fallback_cpu=False)
+        vc._render_devices = lambda: ["/dev/dri/renderD128"]
+
+        def fake_run(cmd, stdout=None, stderr=None, timeout=None, env=None, **kwargs):
+            if "-version" in cmd:
+                return subprocess.CompletedProcess(cmd, 0)
+            if "-f" in cmd and "lavfi" in cmd:
+                return subprocess.CompletedProcess(cmd, 234, stderr=b"init failed")
+            return subprocess.CompletedProcess(cmd, 0)
+
+        self.converter_module.subprocess.run = fake_run
+
+        ok, message = vc.preflight_check(str(self.work))
+
+        self.assertFalse(ok)
+        self.assertTrue(vc.use_gpu)
+        self.assertIn("GPU/QSV 自检失败", message)
+
+    def test_preflight_missing_dri_device_falls_back_to_cpu_when_enabled(self):
+        """无 /dev/dri/renderD* 设备时，开启 gpu_fallback_cpu 应降级为 CPU"""
+        vc = self.converter_module.VideoConverter(
+            self.db, use_gpu=True, temp_dir=str(self.work), gpu_fallback_cpu=True)
+        vc._render_devices = lambda: []
+
+        def fake_run(cmd, stdout=None, stderr=None, timeout=None, env=None, **kwargs):
+            if "-version" in cmd:
+                return subprocess.CompletedProcess(cmd, 0)
+            return subprocess.CompletedProcess(cmd, 0)
+
+        self.converter_module.subprocess.run = fake_run
+
+        ok, message = vc.preflight_check(str(self.work))
+
+        self.assertTrue(ok, message)
+        self.assertFalse(vc.use_gpu)
+        self.assertIn("降级", message)
+
+    def test_detect_libva_driver_amd_returns_radeonsi(self):
+        # AMD 显卡（vendor 0x1002）应选择 radeonsi 驱动
+        class FakePath:
+            def __init__(self, p):
+                self.p = p
+                if p.endswith("/vendor"):
+                    self._vendor = "0x1002"
+                else:
+                    self._vendor = None
+
+            def __truediv__(self, other):
+                return FakePath(f"{self.p}/{other}")
+
+            def glob(self, pattern):
+                return [FakePath(f"/sys/class/drm/{n}") for n in ("card0", "card1")]
+
+            def read_text(self):
+                return self._vendor
+
+            def __eq__(self, other):
+                return isinstance(other, FakePath) and self.p == other.p
+
+            def __lt__(self, other):
+                return self.p < other.p
+
+            def __hash__(self):
+                return hash(self.p)
+
+        original_path = self.converter_module.Path
+        self.converter_module.Path = FakePath
+        try:
+            self.assertEqual(self.converter_module.VideoConverter._detect_libva_driver_name(), "radeonsi")
+        finally:
+            self.converter_module.Path = original_path
+
+    def test_detect_libva_driver_intel_returns_iHD(self):
+        # Intel 显卡（vendor 0x8086）应选择 iHD 驱动
+        class FakePath:
+            def __init__(self, p):
+                self.p = p
+                self._vendor = "0x8086" if p.endswith("/vendor") else None
+
+            def __truediv__(self, other):
+                return FakePath(f"{self.p}/{other}")
+
+            def glob(self, pattern):
+                return [FakePath("/sys/class/drm/card0")]
+
+            def read_text(self):
+                return self._vendor
+
+            def __eq__(self, other):
+                return isinstance(other, FakePath) and self.p == other.p
+
+            def __lt__(self, other):
+                return self.p < other.p
+
+            def __hash__(self):
+                return hash(self.p)
+
+        original_path = self.converter_module.Path
+        self.converter_module.Path = FakePath
+        try:
+            self.assertEqual(self.converter_module.VideoConverter._detect_libva_driver_name(), "iHD")
+        finally:
+            self.converter_module.Path = original_path
+
+    def test_ffmpeg_env_respects_user_set_driver_name(self):
+        # 用户显式配置了 LIBVA_DRIVER_NAME 时应尊重，不做厂商探测覆盖
+        vc = self.converter_module.VideoConverter(self.db, use_gpu=True, temp_dir=str(self.work))
+        original_env = self.converter_module.os.environ
+        saved = dict(original_env)
+        original_env["LIBVA_DRIVER_NAME"] = "custom-driver"
+        try:
+            env = vc._ffmpeg_env()
+        finally:
+            original_env.clear()
+            original_env.update(saved)
+        self.assertEqual(env["LIBVA_DRIVER_NAME"], "custom-driver")
 
     def test_temp_output_filename_is_short_and_safe(self):
         weird_video = self.work / ("A" * 120 + " @[] 中文 spaces.mp4")

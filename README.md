@@ -1,8 +1,8 @@
 # 飞牛 NAS 视频自动转码工具
 
-面向飞牛 fnOS 的本地自用视频转码应用。它定时扫描授权目录，把符合条件的视频串行转码为 H.264/H.265，并支持 Intel Quick Sync Video（QSV）硬件编码。
+面向飞牛 fnOS 的本地自用视频转码应用。它定时扫描授权目录，把符合条件的视频串行转码为 H.264/H.265，并支持 Intel Quick Sync Video（QSV）与 AMD VAAPI 硬件编码。
 
-- 当前可用版本：`v1.0.56`
+- 当前可用版本：`v1.0.57`
 - 完整迭代记录见 [CHANGELOG.md](./CHANGELOG.md)
 
 ## 下载与安装
@@ -25,19 +25,18 @@
 
 ## GPU 转码说明
 
-勾选 GPU 加速后，应用会强制使用 Intel QSV：
+勾选 GPU 加速后，应用按实际显卡厂商自动选择驱动并强制使用 QSV：
 
-- H.264 目标编码使用 `h264_qsv`
-- H.265 目标编码使用 `hevc_qsv`
-- QSV 失败时停止当前文件，不自动降级 CPU
+- H.264 目标编码使用 `h264_qsv`，H.265 目标编码使用 `hevc_qsv`
 - 启动前会用极短测试视频先验证 QSV 是否可用
+- 勾选「GPU 不可用时自动降级 CPU 转码」后，若自检失败会自动改用 CPU 转码继续服务；不勾选则 QSV 失败时停止，不降级
 
-应用会优先复用飞牛 mediasrv 的运行环境：
+应用会优先复用飞牛 mediasrv 的运行环境。驱动目录与运行库路径会在系统与 mediasrv 之间合并，驱动名按显卡厂商自动选择：
 
 ```text
 ffmpeg=/usr/trim/lib/mediasrv/ffmpeg
-LIBVA_DRIVER_NAME=iHD
-LIBVA_DRIVERS_PATH=/usr/trim/lib/mediasrv/dri
+LIBVA_DRIVER_NAME=自动选择（Intel=iHD，AMD=radeonsi）
+LIBVA_DRIVERS_PATH=/usr/trim/lib/mediasrv/dri:/usr/lib/x86_64-linux-gnu/dri
 qsv_device=/dev/dri/renderD*
 ```
 
@@ -111,7 +110,8 @@ qsv_device=/dev/dri/renderD*
 | 格式 | MP4 或 MKV | MP4 |
 | 分辨率 | 保留原分辨率 / 1080p / 自定义参数三种模式 | 1080p |
 | 自定义参数 | 仅在"自定义参数"模式生效，格式如 `-2:1080`、`1920x-2` 或 `scale=-2:1080`，带非法字符白名单校验 | 空 |
-| GPU 加速 | Intel QSV 硬件编码 | 开启 |
+| GPU 加速 | 按显卡厂商选择 QSV（Intel=QSV / AMD=QSV via VAAPI）硬件编码 | 开启 |
+| GPU 不可用时自动降级 CPU | 自检失败时改用 CPU 转码继续服务，适合 AMD、驱动未装、虚拟机透传等环境 | 关闭 |
 
 ## 优点
 
@@ -184,6 +184,7 @@ fpkconverter.fpk
 
 详细迭代记录见 [CHANGELOG.md](./CHANGELOG.md)。最近版本：
 
+- **v1.0.57**：新增「GPU 不可用时自动降级 CPU」开关；驱动发现按显卡厂商自动选择（Intel=iHD / AMD=radeonsi），不再硬编码单一 Intel 驱动。
 - **v1.0.56**：新增多监控文件夹；分辨率控制（保留原分辨率 / 1080p / 自定义参数，带白名单校验）；修复统计只统计最近 100 条的问题。
 - **v1.0.55**：核查修复次生问题：重新检测真正生效；重试次数显示真实累计值；失败原因不再串文件；扫描跳过合并单连接；问题面板自清理。
 - **v1.0.54**：修复失败文件反复刷日志；问题文件持久化并静默跳过；Web UI 新增问题文件面板。

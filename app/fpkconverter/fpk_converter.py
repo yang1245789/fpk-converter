@@ -12,7 +12,7 @@ import hashlib
 import re
 from pathlib import Path
 
-VERSION = '1.0.56'
+VERSION = '1.0.57'
 
 
 class Database:
@@ -275,7 +275,8 @@ class VideoConverter:
     TEMP_LOG_MAX_AGE_SECONDS = 7 * 24 * 3600
 
     def __init__(self, db, target_quality=23, codec='libx264', container='mp4',
-                 preset='medium', threads=1, use_gpu=True, temp_dir=''):
+                 preset='medium', threads=1, use_gpu=True, temp_dir='',
+                 gpu_fallback_cpu=False):
         self.db = db
         self.target_quality = max(self.MIN_CRF, min(self.MAX_CRF, int(target_quality)))
         self.codec = codec if codec in self.ALLOWED_CODECS else 'libx265'
@@ -283,6 +284,7 @@ class VideoConverter:
         self.preset = preset if preset in self.ALLOWED_PRESETS else 'medium'
         self.threads = max(1, min(self.MAX_THREADS, int(threads)))
         self.use_gpu = bool(use_gpu)
+        self.gpu_fallback_cpu = bool(gpu_fallback_cpu)
         self.temp_dir = Path(temp_dir) if temp_dir and str(temp_dir).strip() else None
         if self.temp_dir and not self.temp_dir.exists():
             self.temp_dir.mkdir(parents=True, exist_ok=True)
@@ -481,20 +483,93 @@ class VideoConverter:
                 return path
         return 'ffprobe'
 
+    def _mediasrv_path(self):
+        # 飞牛不同版本的 mediasrv 安装目录不同，列为候选逐个探测。
+        for path in (
+            '/usr/trim/lib/mediasrv',
+            '/usr/trim/lib/mediasrv/lib',
+            '/usr/lib/libmediasrv',
+            '/usr/lib/mediasrv',
+            '/usr/trim/lib/mediasrv/bin',
+        ):
+            if path and os.path.exists(path):
+                return path
+        return ''
+
+    @staticmethod
+    def _driver_search_paths():
+        """返回飞牛可能存放 libva 显卡驱动(.so)的目录候选。
+        Intel 对应 iHD_drv_video.so，AMD 对应 radeonsi_drv_video.so；
+        只返回确实存在的目录，供 LIBVA_DRIVERS_PATH 使用。"""
+        candidates = [
+            '/usr/trim/lib/mediasrv/dri',
+            '/usr/trim/lib/mediasrv/lib/dri',
+            '/usr/lib/libmediasrv/lib/dri',
+            '/usr/lib/mediasrv/lib/dri',
+            '/usr/lib/x86_64-linux-gnu/dri',
+        ]
+        return [p for p in candidates if p and os.path.isdir(p)]
+
+    @staticmethod
+    def _library_search_paths():
+        """返回飞牛 mediasrv 运行库目录候选，供 LD_LIBRARY_PATH 使用。"""
+        candidates = [
+            '/usr/trim/lib/mediasrv',
+            '/usr/trim/lib/mediasrv/lib',
+            '/usr/lib/libmediasrv/lib',
+            '/usr/lib/mediasrv/lib',
+        ]
+        return [p for p in candidates if p and os.path.isdir(p)]
+
+    @staticmethod
+    def _detect_libva_driver_name():
+        """按实际显卡厂商选择 libva 驱动名：
+        Intel → iHD，AMD → radeonsi。飞牛/fnOS 自带两套驱动，探测 sysfs
+        的 PCI vendor 决定，避免默认 iHD 在 AMD 机器上 init failed。
+        无法识别厂商时回退 iHD（Intel 最常见）。"""
+        vendor_dirs = []
+        try:
+            dri_root = Path('/sys/class/drm')
+            for card in sorted(dri_root.glob('card*')):
+                dev = card / 'device'
+                if dev / 'vendor' not in vendor_dirs:
+                    vendor_dirs.append(dev / 'vendor')
+        except Exception:
+            vendor_dirs = []
+        for vf in vendor_dirs:
+            try:
+                vendor = vf.read_text().strip().lower()
+            except Exception:
+                continue
+            if vendor in ('0x1002', '0x1022'):   # ATI / AMD
+                return 'radeonsi'
+            if vendor in ('0x8086',):            # Intel
+                return 'iHD'
+        return 'iHD'
+
     def _ffmpeg_env(self):
         env = os.environ.copy()
         if self.use_gpu:
-            env['LIBVA_DRIVER_NAME'] = env.get('LIBVA_DRIVER_NAME') or 'iHD'
-            drivers_path = '/usr/trim/lib/mediasrv/dri'
-            mediasrv_path = self._mediasrv_path()
-            if os.path.exists(drivers_path):
-                env['LIBVA_DRIVERS_PATH'] = drivers_path
-            if mediasrv_path:
-                old_ld = env.get('LD_LIBRARY_PATH', '')
-                parts = [p for p in old_ld.split(':') if p]
-                if mediasrv_path not in parts:
-                    parts.insert(0, mediasrv_path)
-                env['LD_LIBRARY_PATH'] = ':'.join(parts)
+            # 不强制覆盖用户已设置的 LIBVA_DRIVER_NAME；未设置时按显卡厂商探测
+            # （Intel→iHD / AMD→radeonsi），避免 AMD 机器默认用 iHD 而 init failed。
+            if not env.get('LIBVA_DRIVER_NAME'):
+                env['LIBVA_DRIVER_NAME'] = self._detect_libva_driver_name()
+            # 驱动目录：合并系统已在用的路径与飞牛自带候选，减少"DRI driver 找不到"这类失败。
+            existing = [p for p in env.get('LIBVA_DRIVERS_PATH', '').split(':') if p]
+            merged = self._driver_search_paths()
+            for p in reversed(existing):
+                if p not in merged:
+                    merged.insert(0, p)
+            if merged:
+                env['LIBVA_DRIVERS_PATH'] = ':'.join(merged)
+            # 运行库路径：把飞牛 mediasrv 的 lib 目录优先加入，保证 ffmpeg 用的 libva 与驱动 ABI 匹配。
+            existing_ld = [p for p in env.get('LD_LIBRARY_PATH', '').split(':') if p]
+            merged_ld = self._library_search_paths()
+            for p in reversed(existing_ld):
+                if p not in merged_ld:
+                    merged_ld.insert(0, p)
+            if merged_ld:
+                env['LD_LIBRARY_PATH'] = ':'.join(merged_ld)
         return env
 
     def _render_devices(self):
@@ -566,6 +641,10 @@ class VideoConverter:
               f"LIBVA_DRIVERS_PATH={env.get('LIBVA_DRIVERS_PATH', '')}")
         devices = self._render_devices()
         if not devices:
+            if self.gpu_fallback_cpu:
+                print("GPU/QSV 自检失败: 未找到 /dev/dri/renderD* 设备。已开启自动降级，改用 CPU 转码。")
+                self.use_gpu = False
+                return True, "GPU 不可用，已自动降级为 CPU 转码"
             return False, "GPU/QSV 自检失败: 未找到 /dev/dri/renderD* 设备"
         last_error = ''
         for device in devices:
@@ -582,6 +661,11 @@ class VideoConverter:
                 return True, f"GPU/QSV 自检通过: {device}"
             last_error = self._completed_process_output(result)
             print(f"GPU/QSV 自检失败: {device}，{last_error}")
+        if self.gpu_fallback_cpu:
+            print("GPU/QSV 自检失败。已开启自动降级，改用 CPU 转码。最后错误: "
+                  f"{last_error[-200:]}")
+            self.use_gpu = False
+            return True, "GPU 不可用（QSV 驱动初始化失败），已自动降级为 CPU 转码"
         return False, f"GPU/QSV 自检失败，正式转码不会启动。最后错误: {last_error}"
 
     def get_file_size(self, filepath):
